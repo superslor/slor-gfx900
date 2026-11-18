@@ -1,0 +1,13 @@
+[Unit]
+Description=MI25 power table and power cap
+After=systemd-modules-load.service systemd-udev-settle.service
+Before=llama-router.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/gpu-setup start
+ExecStop=/usr/local/sbin/gpu-setup stop
+
+[Install]
+WantedBy=multi-user.target

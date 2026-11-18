@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 05:21:17 -0600
+Subject: [PATCH 17/19] speculative: a separate draft model gets its own
+ micro-batch (LLAMA_SPEC_DRAFT_UBATCH)
+
+Its compute buffer scales with n_ubatch (Gemma 4 12B's drafter: 1305 MiB at 2048, 326 at 512), which
+kept it from fitting beside the target on a 16 GB card; the target keeps its -ub. Default 512, 0 = the
+target's. MI25, Gemma 4 12B with its QAT drafter, 2 drafts: short 36.5 -> 47.8 t/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ common/speculative.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f62c2ef29..a191ae647 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -3209,6 +3209,18 @@ common_speculative_init_result::common_speculative_init_result(
+ 
+         pimpl->model.reset(model_dft);
+ 
++        // a separate draft model gets its own, smaller micro-batch. Its compute buffer scales with n_ubatch
++        // (Gemma 4 12B's drafter: 1305 MiB at 2048, 326 at 512), and only that much stopped it fitting beside the
++        // target on a 16 GB card; the target keeps its own n_ubatch, so prompt reading is unchanged.
++        // LLAMA_SPEC_DRAFT_UBATCH=N sets it (0 = the target's).
++        {
++            const char * e  = std::getenv("LLAMA_SPEC_DRAFT_UBATCH");
++            const int    ub = e ? std::atoi(e) : 512;
++            if (ub > 0 && (uint32_t) ub < cparams.n_ubatch) {
++                cparams.n_ubatch = ub;
++            }
++        }
++
+         const char * greedy_env = std::getenv("LLAMA_DSPARK_GREEDY_IDS");
+         if (greedy_env && std::strcmp(greedy_env, "1") == 0) {
+             llama_dspark_meta meta;

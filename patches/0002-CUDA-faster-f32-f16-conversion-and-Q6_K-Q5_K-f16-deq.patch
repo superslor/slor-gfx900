@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 04:10:11 -0500
+Subject: [PATCH 02/19] CUDA: faster f32 -> f16 conversion and Q6_K/Q5_K -> f16
+ dequantization
+
+The prompt path expands activations and weights to f16 for rocBLAS. Contiguous conversion now moves 4
+values a thread with 16-byte loads (from qr0n/p100-llama-cpp), and Q6_K/Q5_K dequantize 32/16
+consecutive outputs a thread through shared memory. P100, 4096x14336 Q6_K: 506 -> 323 us per call.
+GGML_CUDA_DEQ_FAST=0 restores the generic dequantizers.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ ggml/src/ggml-cuda/convert.cu | 186 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 186 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index b65cc2e36..590a198a9 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -1,4 +1,5 @@
+ #include "convert.cuh"
++#include <type_traits>
+ #include "dequantize.cuh"
+ 
+ #include <cstdint>
+@@ -247,6 +248,121 @@ static __global__ void dequantize_block_q5_K(const void * __restrict__ vx, dst_t
+     dequantize_q5_K(vx, i, yy + i*QK_K, threadIdx.x);
+ }
+ 
++// Fast fp16 paths for the K-quant dequantizers that feed cuBLAS on cards without dp4a/MMQ
++// (Pascal: every weight matrix is expanded to f16 on every ubatch). The generic kernels above do
++// 4 outputs per thread with 1-byte loads and 2-byte stores and run ~6x off the bandwidth floor on
++// a P100 (121 GB/s measured, 2026-10-21). These produce 32 (q6_K) / 16 (q5_K) consecutive outputs
++// per thread and store them as 16-byte vectors; the block layouts are only 2-byte aligned (q6_K is
++// 210 bytes), so the quant bytes are read individually and the outputs are what gets vectorised.
++static __global__ void dequantize_block_q6_K_f16_fast(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
++    // 32 super-blocks (6720 bytes) per CUDA block, staged through shared memory with coalesced
++    // 4-byte loads; 8 threads per super-block, 32 consecutive outputs each, 16-byte stores.
++    constexpr int SB = 32;
++    constexpr int SBYTES = (int) sizeof(block_q6_K); // 210
++    __shared__ __align__(16) uint8_t sm[SB*SBYTES];
++    const int64_t ib0 = (int64_t) blockIdx.x * SB;
++    const int64_t n_here = nb - ib0 < SB ? nb - ib0 : SB;
++    const int bytes = (int) n_here * SBYTES;
++    const uint8_t * src = (const uint8_t *) vx + ib0*SBYTES;
++    if (bytes == SB*SBYTES) {
++        for (int w = threadIdx.x; w < SB*SBYTES/4; w += blockDim.x) {
++            ((uint32_t *) sm)[w] = ((const uint32_t *) src)[w];
++        }
++    } else {
++        for (int b = threadIdx.x; b < bytes; b += blockDim.x) {
++            sm[b] = src[b];
++        }
++    }
++    __syncthreads();
++    const int ibl = threadIdx.x >> 3;
++    if (ibl >= n_here) {
++        return;
++    }
++    const int ip = (threadIdx.x >> 2) & 1;
++    const int il = (threadIdx.x & 3) * 8;
++    const block_q6_K * x = (const block_q6_K *) (sm + ibl*SBYTES);
++    const float d = x->d;
++    const uint8_t * ql = x->ql + 64*ip + il;
++    const uint8_t * qh = x->qh + 32*ip + il;
++    const int8_t  * sc = x->scales + 8*ip + il/16;
++    const float d0 = d*sc[0], d2 = d*sc[2], d4 = d*sc[4], d6 = d*sc[6];
++    half2 o0[4], o32[4], o64[4], o96[4];
++#pragma unroll
++    for (int j = 0; j < 8; j += 2) {
++        float v0[2], v32[2], v64[2], v96[2];
++#pragma unroll
++        for (int u = 0; u < 2; ++u) {
++            const int q0  = ql[j + u];
++            const int q32 = ql[32 + j + u];
++            const int h   = qh[j + u];
++            v0 [u] = d0 * (float) ((int8_t) ((q0  & 0xF) | (((h >> 0) & 3) << 4)) - 32);
++            v32[u] = d2 * (float) ((int8_t) ((q32 & 0xF) | (((h >> 2) & 3) << 4)) - 32);
++            v64[u] = d4 * (float) ((int8_t) ((q0  >>  4) | (((h >> 4) & 3) << 4)) - 32);
++            v96[u] = d6 * (float) ((int8_t) ((q32 >>  4) | (((h >> 6) & 3) << 4)) - 32);
++        }
++        o0 [j/2] = __floats2half2_rn(v0 [0], v0 [1]);
++        o32[j/2] = __floats2half2_rn(v32[0], v32[1]);
++        o64[j/2] = __floats2half2_rn(v64[0], v64[1]);
++        o96[j/2] = __floats2half2_rn(v96[0], v96[1]);
++    }
++    half * y = yy + (ib0 + ibl)*QK_K + 128*ip + il;
++    *(uint4 *) (y +  0) = *(const uint4 *) o0;
++    *(uint4 *) (y + 32) = *(const uint4 *) o32;
++    *(uint4 *) (y + 64) = *(const uint4 *) o64;
++    *(uint4 *) (y + 96) = *(const uint4 *) o96;
++}
++
++static __global__ void dequantize_block_q5_K_f16_fast(const void * __restrict__ vx, half * __restrict__ yy, const int64_t nb) {
++    // 16 super-blocks (2816 bytes) per CUDA block through shared memory; 16 threads per super-block.
++    constexpr int SB = 16;
++    constexpr int SBYTES = (int) sizeof(block_q5_K); // 176
++    __shared__ __align__(16) uint8_t sm[SB*SBYTES];
++    const int64_t ib0 = (int64_t) blockIdx.x * SB;
++    const int64_t n_here = nb - ib0 < SB ? nb - ib0 : SB;
++    const int bytes = (int) n_here * SBYTES;
++    const uint8_t * src = (const uint8_t *) vx + ib0*SBYTES;
++    for (int w = threadIdx.x; w < bytes/4; w += blockDim.x) {
++        ((uint32_t *) sm)[w] = ((const uint32_t *) src)[w];   // 176 is a multiple of 4
++    }
++    __syncthreads();
++    const int ibl = threadIdx.x >> 4;
++    if (ibl >= n_here) {
++        return;
++    }
++    const int il = (threadIdx.x >> 2) & 3;
++    const int ir = (threadIdx.x & 3) * 8;
++    const block_q5_K * x = (const block_q5_K *) (sm + ibl*SBYTES);
++    const float dall = __low2half(x->dm);
++    const float dmin = __high2half(x->dm);
++    const uint8_t * ql = x->qs + 32*il + ir;
++    const uint8_t * qh = x->qh + ir;
++    const int is = 2*il;
++    uint8_t sc, m;
++    get_scale_min_k4(is + 0, x->scales, sc, m);
++    const float d1 = dall * sc; const float m1 = dmin * m;
++    get_scale_min_k4(is + 1, x->scales, sc, m);
++    const float d2 = dall * sc; const float m2 = dmin * m;
++    const uint8_t hm1 = 1 << (2*il);
++    const uint8_t hm2 = hm1 << 1;
++    half2 oa[4], ob[4];
++#pragma unroll
++    for (int j = 0; j < 8; j += 2) {
++        float a[2], b[2];
++#pragma unroll
++        for (int u = 0; u < 2; ++u) {
++            const int q = ql[j + u];
++            const int h = qh[j + u];
++            a[u] = d1 * (float) ((q & 0xF) + ((h & hm1) ? 16 : 0)) - m1;
++            b[u] = d2 * (float) ((q >>  4) + ((h & hm2) ? 16 : 0)) - m2;
++        }
++        oa[j/2] = __floats2half2_rn(a[0], a[1]);
++        ob[j/2] = __floats2half2_rn(b[0], b[1]);
++    }
++    half * y = yy + (ib0 + ibl)*QK_K + 64*il + ir;
++    *(uint4 *) (y +  0) = *(const uint4 *) oa;
++    *(uint4 *) (y + 32) = *(const uint4 *) ob;
++}
++
+ template<typename dst_t>
+ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+     const int64_t i = blockIdx.x;
+@@ -386,12 +502,26 @@ static void dequantize_row_q4_K_cuda(const void * vx, dst_t * y, const int64_t k
+ template<typename dst_t>
+ static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = k / QK_K;
++    if constexpr (std::is_same<dst_t, half>::value) {
++        static const bool fast = [] { const char * e = getenv("GGML_CUDA_DEQ_FAST"); return !e || e[0] != '0'; }();
++        if (fast) {
++            dequantize_block_q5_K_f16_fast<<<(unsigned) ((nb + 15) / 16), 256, 0, stream>>>(vx, (half *) y, nb);
++            return;
++        }
++    }
+     dequantize_block_q5_K<<<nb, 64, 0, stream>>>(vx, y);
+ }
+ 
+ template<typename dst_t>
+ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = k / QK_K;
++    if constexpr (std::is_same<dst_t, half>::value) {
++        static const bool fast = [] { const char * e = getenv("GGML_CUDA_DEQ_FAST"); return !e || e[0] != '0'; }();
++        if (fast) {
++            dequantize_block_q6_K_f16_fast<<<(unsigned) ((nb + 31) / 32), 256, 0, stream>>>(vx, (half *) y, nb);
++            return;
++        }
++    }
+     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+ }
+ 
+@@ -531,8 +661,64 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
+         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
+ }
+ 
++// Vectorised contiguous conversion.
++//
++// The generic convert_unary above handles arbitrary strides and converts ONE
++// element per thread. convert_unary_cont_cuda always passes the fully
++// contiguous case (ne01 = ne02 = ne03 = 1), where that degenerates to
++// y[i] = cast(x[i]) with a 4-byte load and a 2-byte store per thread.
++//
++// Measured on a Tesla P100 (GP100, sm_60), Qwen3.8-27B, 2048-token prefill:
++// the dominant launch converts 2048*5120 = 10485760 f32 elements to f16 in
++// 382.5 us, i.e. 62.9 MB moved at 164 GB/s. The same card sustains ~500 GB/s
++// on mixed read+write traffic and 607 GB/s on pure reads (bench/sweep.cu), so
++// the scalar kernel runs at about a third of what the memory system allows.
++// convert_unary is 6.1% of prefill on this machine.
++//
++// Processing CONV_VEC elements per thread turns that into a 16-byte load and
++// an 8-byte store for f32->f16. Falls back to the generic kernel whenever the
++// pointers or the element count are not suitably aligned.
++#define CONV_VEC 4
++
++template <typename T> struct __align__(16) conv_vec_t { T v[CONV_VEC]; };
++
++template <typename src_t, typename dst_t>
++static __global__ void convert_unary_cont_vec(
++        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k) {
++    const int64_t i = CONV_VEC*((int64_t)blockDim.x*blockIdx.x + threadIdx.x);
++
++    if (i >= k) {
++        return;
++    }
++
++    const src_t * x = (const src_t *) vx;
++
++    const conv_vec_t<src_t> sv = *((const conv_vec_t<src_t> *) (x + i));
++    conv_vec_t<dst_t> dv;
++#pragma unroll
++    for (int j = 0; j < CONV_VEC; ++j) {
++        dv.v[j] = ggml_cuda_cast<dst_t>(sv.v[j]);
++    }
++    *((conv_vec_t<dst_t> *) (y + i)) = dv;
++}
++
+ template <typename src_t, typename dst_t>
+ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
++    // The vector path reads and writes CONV_VEC elements at a time, so it needs
++    // the element count to be a multiple of CONV_VEC and both pointers aligned
++    // to the vector width. Anything else takes the generic kernel unchanged.
++    const bool can_vec =
++        (k % CONV_VEC == 0) &&
++        (((uintptr_t) vx) % (CONV_VEC*sizeof(src_t)) == 0) &&
++        (((uintptr_t) y)  % (CONV_VEC*sizeof(dst_t)) == 0);
++
++    if (can_vec) {
++        const int64_t nthreads = k / CONV_VEC;
++        const int64_t nblocks  = (nthreads + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
++        convert_unary_cont_vec<src_t, dst_t><<<nblocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k);
++        return;
++    }
++
+     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
+ }
+ 

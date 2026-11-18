@@ -1,0 +1,41 @@
+#!/bin/bash
+# At boot, before llama-router: load each card's edited power table (only over the exact firmware table it was
+# made from) and cap every AMD card at CAP_W. "stop" puts the default cap back.
+set -u
+CAP_W=200
+[ -f /etc/default/gpu-setup ] && . /etc/default/gpu-setup
+PP_DIR=/usr/local/lib/gpu-setup   # <name>.pptable + <name>.orig.sha256, from make-pptable.py
+
+amd_hwmon() {
+    for dev in /sys/class/drm/card[0-9]*/device; do
+        [ "$(cat "$dev/vendor" 2>/dev/null)" = "0x1002" ] || continue
+        ls -d "$dev"/hwmon/hwmon* 2>/dev/null
+    done | sort -u
+}
+
+n=$(lspci -n -d 1002: | grep -cE " 03(00|02|80): ")
+[ "$n" -gt 0 ] || { echo "gpu-setup: no AMD GPU found"; exit 1; }
+for _ in $(seq 60); do [ "$(amd_hwmon | wc -l)" -ge "$n" ] && break; sleep 1; done   # a second card can come up late
+
+if [ "${1:-start}" = stop ]; then
+    for h in $(amd_hwmon); do [ -f "$h/power1_cap_default" ] && cat "$h/power1_cap_default" > "$h/power1_cap"; done
+    exit 0
+fi
+
+for h in $(amd_hwmon); do
+    dev=$(readlink -f "$h/../..")
+    now=$(sha256sum < "$dev/pp_table" | cut -c1-64)
+    for t in "$PP_DIR"/*.pptable; do
+        [ -f "$t" ] && [ "$now" = "$(cat "${t%.pptable}.orig.sha256" 2>/dev/null)" ] || continue
+        modprobe vega10_avfs_keep 2>/dev/null || echo "gpu-setup: vega10_avfs_keep missing - AVFS goes off with the table"
+        if cat "$t" > "$dev/pp_table" 2>/dev/null; then echo "gpu-setup: loaded $(basename "$t")"
+        else echo "gpu-setup: could not load $(basename "$t") (is amdgpu.ppfeaturemask=0xfff7ffff on the kernel line?)"
+        fi
+        sleep 2
+    done
+    max=$(cat "$h/power1_cap_max" 2>/dev/null || echo 0)
+    cap=$((CAP_W * 1000000))
+    [ "$max" -gt 0 ] && [ $cap -gt "$max" ] && cap=$max
+    echo $cap > "$h/power1_cap"
+    echo "gpu-setup: $(basename "$dev") capped at $(( $(cat "$h/power1_cap") / 1000000 )) W (card limit $(( max / 1000000 )) W)"
+done

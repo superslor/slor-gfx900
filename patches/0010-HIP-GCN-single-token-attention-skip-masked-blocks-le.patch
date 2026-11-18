@@ -1,0 +1,326 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 19:58:28 -0600
+Subject: [PATCH 10/19] HIP GCN single-token attention: skip masked blocks;
+ leaner mask scan and combine
+
+The sliding-window cache is 7168 cells for 5 slots and a token sees 1024 of them: fully masked blocks
+now exit after reading their mask (64 keys a block) and the combine passes over their zero sums. The mask
+scan takes one block per bitmap word (15.9 -> 5.5 us at 20k); the combine lists live blocks and loads 8
+at a time (18.5 -> 9.0 us). Output identical. MI25, Gemma 4 12B at 20k: 17.4 -> 31.6 t/s.
+GGML_CUDA_FA_GCN_SKIP=0 turns the skip off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ ggml/src/ggml-cuda/fattn-common.cuh |  74 ++++++++++++--------
+ ggml/src/ggml-cuda/fattn-gcn.cu     | 104 +++++++++++++++++++++++++---
+ 2 files changed, 138 insertions(+), 40 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index 0ae4bd288..d2da35207 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -741,6 +741,8 @@ static __global__ void flash_attn_mask_to_KV_max(
+ // order, dropping the fully-masked ones is bit-for-bit identical to processing them.
+ #define FATTN_BLOCKS_NTHREADS 256
+ 
++// one CUDA block per bitmap word (32 KV blocks, 8192 tokens), its 256 threads 32 tokens each - the loads
++// all in flight at once. As one block for the whole row it took 15 us at 20k for Gemma's single token, growing with depth.
+ template <int ncols1>
+ __launch_bounds__(FATTN_BLOCKS_NTHREADS, 1)
+ static __global__ void flash_attn_mask_to_KV_bits(
+@@ -748,30 +750,29 @@ static __global__ void flash_attn_mask_to_KV_bits(
+     const half2 * GGML_CUDA_RESTRICT mask = mask_ptr;
+     int         * GGML_CUDA_RESTRICT bits = bits_ptr;
+ 
+-    constexpr int nwarps = FATTN_BLOCKS_NTHREADS / WARP_SIZE;
++    constexpr int tok_per_thread = 32*FATTN_KQ_STRIDE/FATTN_BLOCKS_NTHREADS;    // 32 tokens = 4 x 16 bytes
++    constexpr int thr_per_kb     = FATTN_KQ_STRIDE/tok_per_thread;
++    static_assert(tok_per_thread % 8 == 0 && thr_per_kb <= 32, "bad FATTN_BLOCKS_NTHREADS");
+ 
+     const int ntiles   = gridDim.x;
+     const int jt       = blockIdx.x;
+     const int sequence = blockIdx.y;
+-    const int lane     = threadIdx.x % WARP_SIZE;
+-    const int warp_id  = threadIdx.x / WARP_SIZE;
++    const int word     = blockIdx.z;
+     const int nwords   = (ne30 + 31) / 32;
++    const int kb       = word*32 + threadIdx.x/thr_per_kb;
+ 
+     mask += sequence*s33 + jt*ncols1*s31;
+ 
+-    __shared__ int words[FATTN_MAX_KV_BLOCKS/32];
+-
+-    for (int i = threadIdx.x; i < nwords; i += FATTN_BLOCKS_NTHREADS) {
+-        words[i] = 0;
++    __shared__ int live_s[FATTN_BLOCKS_NTHREADS];
++    __shared__ int word_s;
++    if (threadIdx.x == 0) {
++        word_s = 0;
+     }
+ 
+     ggml_cuda_pdl_sync();
+-    __syncthreads();
+-
+-    // Each warp tests whole KV blocks independently; only the shared bitmap is contended.
+-    for (int kb = warp_id; kb < ne30; kb += nwarps) {
+-        int all_inf = 1;
+ 
++    int live = 0;
++    if (kb < ne30) {
+ #pragma unroll
+         for (int j = 0; j < ncols1; ++j) {
+             // the mask has exactly nrows (= n_tokens) rows, not a multiple of ncols1.
+@@ -781,26 +782,38 @@ static __global__ void flash_attn_mask_to_KV_bits(
+             if (jt*ncols1 + j >= nrows) {
+                 break;
+             }
+-            const half2 * row = mask + j*s31 + kb*(FATTN_KQ_STRIDE/2);
+-
+-            for (int i = lane; i < FATTN_KQ_STRIDE/2; i += WARP_SIZE) {
+-                const float2 tmp = __half22float2(row[i]);
+-                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
++            const uint4 * seg = (const uint4 *) (mask + j*s31 + (int64_t) word*32*(FATTN_KQ_STRIDE/2)) +
++                                threadIdx.x*(tok_per_thread/8);
++#pragma unroll
++            for (int i = 0; i < tok_per_thread/8; ++i) {
++                const uint4 v = seg[i];
++                const uint32_t w[4] = {v.x, v.y, v.z, v.w};
++#pragma unroll
++                for (int k = 0; k < 4; ++k) {
++                    half2 h;
++                    memcpy(&h, &w[k], sizeof(h));
++                    const float2 tmp = __half22float2(h);
++                    live |= !isinf(tmp.x) || !isinf(tmp.y);
++                }
+             }
+         }
++    }
++    live_s[threadIdx.x] = live;
++    __syncthreads();
+ 
+-        all_inf = warp_reduce_all(all_inf);
+-
+-        if (lane == 0 && !all_inf) {
+-            atomicOr(&words[kb / 32], 1 << (kb % 32));
++    if (threadIdx.x < 32) {
++        int any = 0;
++        for (int t = 0; t < thr_per_kb; ++t) {
++            any |= live_s[threadIdx.x*thr_per_kb + t];
++        }
++        if (any) {
++            atomicOr(&word_s, 1 << threadIdx.x);
+         }
+     }
+-
+     __syncthreads();
+ 
+-    int * out = bits + (sequence*ntiles + jt)*nwords;
+-    for (int i = threadIdx.x; i < nwords; i += FATTN_BLOCKS_NTHREADS) {
+-        out[i] = words[i];
++    if (threadIdx.x == 0) {
++        bits[(sequence*ntiles + jt)*nwords + word] = word_s;
+     }
+ }
+ 
+@@ -1056,6 +1069,7 @@ static __global__ void flash_attn_combine_results(
+ 
+     float VKQ_numerator   = 0.0f;
+     float VKQ_denominator = 0.0f;
++#pragma unroll 8 // 8 partial loads in flight instead of one memory wait per part; same order of sums
+     for (int l = 0; l < parallel_blocks; ++l) {
+         const float KQ_max_scale = expf(meta[l].x - kqmax);
+ 
+@@ -1193,18 +1207,20 @@ void launch_fattn(
+     // this, every sequence pays for the total number of cells in use rather than its own.
+     // Restricted to kernels that walk the KV cache with blockIdx.y; the stream-k path
+     // distributes work differently and is not handled here.
+-    if (mask && !stream_k && K->ne[1] % FATTN_KQ_STRIDE == 0 && K->ne[1] >= FATTN_KV_BITS_MIN_KV) {
++    // (the scan reads the mask 16 bytes at a time)
++    if (mask && !stream_k && K->ne[1] % FATTN_KQ_STRIDE == 0 && K->ne[1] >= FATTN_KV_BITS_MIN_KV &&
++            ((uintptr_t) mask->data) % 16 == 0 && mask->nb[1] % 16 == 0 && mask->nb[3] % 16 == 0) {
+         const int iter_k_bits = K->ne[1] / FATTN_KQ_STRIDE;
+ 
+         if (iter_k_bits > 1 && iter_k_bits <= FATTN_MAX_KV_BLOCKS) {
+             const int64_t s31 = mask->nb[1] / sizeof(half2);
+             const int64_t s33 = mask->nb[3] / sizeof(half2);
+ 
+-            const dim3 blocks_num_bits(ntiles_x, Q->ne[3], 1);
+-            const dim3 block_dim_bits(FATTN_BLOCKS_NTHREADS, 1, 1);
+-
+             const int nwords = (iter_k_bits + 31) / 32;
+ 
++            const dim3 blocks_num_bits(ntiles_x, Q->ne[3], nwords);
++            const dim3 block_dim_bits(FATTN_BLOCKS_NTHREADS, 1, 1);
++
+             KV_blocks.alloc(size_t(blocks_num_bits.x) * blocks_num_bits.y * nwords);
+             ggml_cuda_kernel_launch_params launch_params_bits =
+                 ggml_cuda_kernel_launch_params(blocks_num_bits, block_dim_bits, 0, main_stream);
+diff --git a/ggml/src/ggml-cuda/fattn-gcn.cu b/ggml/src/ggml-cuda/fattn-gcn.cu
+index cc9b3941d..43f6c49ce 100644
+--- a/ggml/src/ggml-cuda/fattn-gcn.cu
++++ b/ggml/src/ggml-cuda/fattn-gcn.cu
+@@ -15,7 +15,9 @@ bool ggml_cuda_fattn_gcn_decode_try(ggml_backend_cuda_context &, ggml_tensor *)
+ //  - softmax per head over the block's keys, weights written back to shared memory;
+ //  - values: lanes own 8 dims of the V row, waves take the heads (or, with few heads, split the keys); weights come in
+ //    as broadcasts; packed f16 products folded into f32 every 8 keys;
+-//  - each block leaves an unnormalized partial output plus (max, sum) per head for flash_attn_combine_results.
++//  - each block leaves an unnormalized partial output plus (max, sum) per head for fattn_gcn_combine;
++//  - a block whose keys the mask hides completely leaves only a zero sum: in the sliding-window layers' cache (7168
++//    cells for 5 slots) a token sees 1024, so at depth most blocks would read K and V for nothing.
+ 
+ static constexpr int fattn_gcn_nthreads = 256;
+ 
+@@ -30,7 +32,7 @@ __launch_bounds__(fattn_gcn_nthreads, 2)
+ static __global__ void fattn_gcn_decode(
+         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
+         const half * __restrict__ mask, float * __restrict__ parts, float2 * __restrict__ meta,
+-        const float scale, const float softcap, const int n_kv, const int nchunks,
++        const float scale, const float softcap, const int n_kv, const int nchunks, const int skip_dead,
+         const int64_t nbq2, const int64_t nbk1, const int64_t nbk2, const int64_t nbv1, const int64_t nbv2) {
+     constexpr int SPL = fattn_gcn_nthreads / C;       // lanes per key in the score pass
+     constexpr int DPL = D / SPL;                      // dims per lane there
+@@ -53,6 +55,16 @@ static __global__ void fattn_gcn_decode(
+     const int hkv   = blockIdx.y;
+     const int k0    = chunk * C;
+ 
++    if (skip_dead) {
++        const bool live = tid < C && k0 + tid < n_kv && __half2float(mask[k0 + tid]) != -INFINITY;
++        if (!__syncthreads_or(live)) {
++            if (tid < G) {
++                meta[(int64_t) (hkv*G + tid)*nchunks + chunk] = make_float2(-FLT_MAX / 2.0f, 0.0f);
++            }
++            return;
++        }
++    }
++
+     // queries of this KV head's G heads, scaled, to f16
+     for (int i = tid; i < G * D / 2; i += fattn_gcn_nthreads) {
+         const int g = i / (D / 2);
+@@ -260,8 +272,79 @@ static __global__ void fattn_gcn_decode(
+     }
+ }
+ 
++// flash_attn_combine_results for one token over the blocks with a nonzero sum: a skipped block (all keys masked)
++// never wrote its partial output. The live blocks are listed first, in order, so their loads can be in flight together.
++template <int D>
++__launch_bounds__(D, 1)
++static __global__ void fattn_gcn_combine(
++        const float * __restrict__ parts, const float2 * __restrict__ meta_g, float * __restrict__ dst, const int nchunks) {
++    static_assert(D >= 64, "one full wave lists the live blocks");
++    const int head = blockIdx.x;
++    const int tid  = threadIdx.x;
++    parts  += (int64_t) head*nchunks*D;
++    meta_g += (int64_t) head*nchunks;
++    dst    += (int64_t) head*D;
++
++    extern __shared__ float2 meta[];
++    int * live = (int *) (meta + nchunks);
++    __shared__ int nlive_s;
++    for (int i = tid; i < nchunks; i += D) {
++        meta[i] = meta_g[i];
++    }
++    __syncthreads();
++
++    if (tid < 64) {
++        int n = 0;
++        for (int l0 = 0; l0 < nchunks; l0 += 64) {
++            const int      l = l0 + tid;
++            const bool     v = l < nchunks && meta[l].y != 0.0f;
++            const uint64_t b = __ballot(v);
++            if (v) {
++                live[n + __popcll(b & ((1ull << tid) - 1))] = l;
++            }
++            n += __popcll(b);
++        }
++        if (tid == 0) {
++            nlive_s = n;
++        }
++    }
++    __syncthreads();
++    const int nlive = nlive_s;
++
++    if (nlive == 0) {
++        dst[tid] = 0.0f;
++        return;
++    }
++    float kqmax = -FLT_MAX / 2.0f;
++    for (int i = 0; i < nlive; ++i) {
++        kqmax = fmaxf(kqmax, meta[live[i]].x);
++    }
++    // 8 partial outputs loaded before any is used (a plain loop waited on memory once per part); past the end the
++    // index stays on the last live block and its weight is 0, so the sums are the same, in the same order
++    constexpr int NB = 8;
++    float num = 0.0f;
++    float den = 0.0f;
++    for (int i0 = 0; i0 < nlive; i0 += NB) {
++        float p[NB];
++#pragma unroll
++        for (int u = 0; u < NB; ++u) {
++            p[u] = parts[live[min(i0 + u, nlive - 1)]*D + tid];
++        }
++#pragma unroll
++        for (int u = 0; u < NB; ++u) {
++            if (i0 + u < nlive) {
++                const float2 ml = meta[live[i0 + u]];
++                const float  sc = expf(ml.x - kqmax);
++                num += sc * p[u];
++                den += sc * ml.y;
++            }
++        }
++    }
++    dst[tid] = num / den;
++}
++
+ template <int D, int G>
+-static void fattn_gcn_decode_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int C) {
++static void fattn_gcn_decode_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int C, const int skip_dead) {
+     const ggml_tensor * Q    = dst->src[0];
+     const ggml_tensor * K    = dst->src[1];
+     const ggml_tensor * V    = dst->src[2];
+@@ -287,7 +370,7 @@ static void fattn_gcn_decode_launch(ggml_backend_cuda_context & ctx, ggml_tensor
+ #define FATTN_GCN_LAUNCH(C_)                                                                                            \
+     fattn_gcn_decode<D, G, C_><<<grid, fattn_gcn_nthreads, 0, stream>>>(                                                \
+         (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,              \
+-        parts.get(), meta.get(), scale, softcap, n_kv, nchunks, Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2])
++        parts.get(), meta.get(), scale, softcap, n_kv, nchunks, skip_dead, Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2])
+     if constexpr (G*D > 2048) {                       // 256 keys a block would leave these 1 block a CU (and spill)
+         if (C == 64) { FATTN_GCN_LAUNCH(64); } else { FATTN_GCN_LAUNCH(128); }
+     } else {
+@@ -300,14 +383,15 @@ static void fattn_gcn_decode_launch(ggml_backend_cuda_context & ctx, ggml_tensor
+ #undef FATTN_GCN_LAUNCH
+     CUDA_CHECK(cudaGetLastError());
+ 
+-    // dst is [D, heads, 1 token, 1 sequence]: the combine's (col, head, sequence) grid with parallel_blocks = nchunks
+-    flash_attn_combine_results<D><<<dim3(1, hq, 1), D, nchunks*sizeof(float2), stream>>>(
++    // dst is [D, heads, 1 token, 1 sequence]
++    fattn_gcn_combine<D><<<hq, D, nchunks*(sizeof(float2) + sizeof(int)), stream>>>(
+         parts.get(), meta.get(), (float *) dst->data, nchunks);
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+ bool ggml_cuda_fattn_gcn_decode_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_FA_GCN_DECODE"); return !e || atoi(e) != 0; }();
++    static const int  skip    = [] { const char * e = getenv("GGML_CUDA_FA_GCN_SKIP");   return !e || atoi(e) != 0; }();
+     const ggml_tensor * Q    = dst->src[0];
+     const ggml_tensor * K    = dst->src[1];
+     const ggml_tensor * V    = dst->src[2];
+@@ -329,14 +413,12 @@ bool ggml_cuda_fattn_gcn_decode_try(ggml_backend_cuda_context & ctx, ggml_tensor
+     const int D = K->ne[0];
+     const int G = Q->ne[2] / K->ne[2];
+     GGML_UNUSED(V);
+-    // Enough blocks for 56 CUs at 2 a CU: the most keys per block (fewer partials to combine) that still gives ~112.
+-    // D512 x 16 heads stops at 128: queries (16 KB) + scores at 256 keys (16 KB) would leave 1 block a CU.
+-    const int64_t nk = K->ne[1]*K->ne[2];
+-    const int C = nk >= 256*112 ? 256 : nk >= 128*112 ? 128 : 64;
++    // 64 keys a block: Gemma 4 12B writes 31.6 t/s at 20k vs 31.3 at 128 and 29.9 at 256 (36.1 / 35.7 / 33.8 short).
++    const int C = 64;
+     // (D512 x 16, Gemma's global layers: 541 vs the tile kernel's 311 us at 20k - per-lane K rows read at 74 GB/s,
+     // every wave re-reading V, and a 160-part combine - so those stay on the tile kernel.)
+     if (D == 256 && G == 2) {
+-        fattn_gcn_decode_launch<256, 2>(ctx, dst, C);
++        fattn_gcn_decode_launch<256, 2>(ctx, dst, C, skip);
+         return true;
+     }
+     return false;

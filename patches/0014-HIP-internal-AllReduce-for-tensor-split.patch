@@ -1,0 +1,294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:28:08 -0600
+Subject: [PATCH 14/19] HIP: internal AllReduce for tensor split
+
+allreduce.cu was CUDA-only, so HIP fell back to the meta backend's fp32 host round-trips with both GPUs
+idle at every sync. Now HIP takes it too: coherent mapped host buffers for the polled flags, s_sleep
+back-off in the spin-wait. The copy-engine H2D runs on its own stream (from qr0n/p100-llama-cpp) and the
+AR streams at the highest priority (GGML_CUDA_AR_HIPRIO=0 for the default). GGML_CUDA_AR_HOSTSYNC=1
+orders the copy-engine path through the host instead of cross-device stream waits (-2% reading).
+GGML_CUDA_ALLREDUCE=none goes back to the meta backend.
+
+Qwen3.8 27B on two MI25s (one on PCIe 2.0 x4 without PCIe atomics): 20k read 118 -> 273 t/s, writing
+17 -> 20.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ ggml/src/ggml-cuda/allreduce.cu | 156 +++++++++++++++++++++++++-------
+ 1 file changed, 121 insertions(+), 35 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/allreduce.cu b/ggml/src/ggml-cuda/allreduce.cu
+index d56129a22..4e65fe32e 100644
+--- a/ggml/src/ggml-cuda/allreduce.cu
++++ b/ggml/src/ggml-cuda/allreduce.cu
+@@ -1,6 +1,6 @@
+ #include "allreduce.cuh"
+ 
+-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#if !defined(GGML_USE_MUSA)
+ 
+ #include "convert.cuh"
+ #include "ggml-impl.h"
+@@ -10,6 +10,16 @@
+ #include <cstring>
+ #include <limits>
+ 
++#if defined(GGML_USE_HIP)
++// HIP names used only here. CUDA mapped pinned memory is coherent, and both GPUs poll it, so ask HIP for coherent memory too.
++#define cudaHostAlloc                    hipHostMalloc
++#define cudaHostAllocMapped              (hipHostMallocMapped | hipHostMallocCoherent)
++#define cudaHostAllocPortable            hipHostMallocPortable
++#define cudaHostGetDevicePointer         hipHostGetDevicePointer
++#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
++#define cudaStreamCreateWithPriority     hipStreamCreateWithPriority
++#endif // defined(GGML_USE_HIP)
++
+ // ---------------------------------------------------------------------------
+ // CUDA AllReduce for tensor-parallel inference across two GPUs.
+ //
+@@ -161,7 +171,9 @@ static __global__ void ggml_cuda_ar_kernel(
+         __threadfence_system(); // make our signal visible system-wide
+ 
+         while (ggml_cuda_ar_signal_get(other_slot) != token) {
+-#if __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
++#if defined(GGML_USE_HIP)
++            __builtin_amdgcn_s_sleep(2); // ~128 clocks
++#elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
+             __nanosleep(100);
+ #else
+             NO_DEVICE_CODE;
+@@ -304,13 +316,18 @@ struct ggml_cuda_ar_pipeline {
+     size_t   copy_threshold;
+     size_t   copy_chunk_bytes;
+     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
++    bool     hostsync;       // copy-engine path: the host waits on the peer's events; streams never wait on another device's event
+     uint64_t call_count;
+ 
+     // Per-device resources.
+     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
+     ggml_cuda_ar_host_mapping host_large[GGML_CUDA_MAX_DEVICES]; // pinned staging (copy-engine)
+     char *                    dev_tmp[GGML_CUDA_MAX_DEVICES];    // device scratch for copy-engine path
+-    cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking
++    cudaStream_t             streams[GGML_CUDA_MAX_DEVICES];   // non-blocking; copy-engine D2H (stage 1)
++    // Copy-engine H2D (stage 2) gets its own stream so it can run on the second
++    // copy engine concurrently with the next chunk's D2H.  On a single stream the
++    // two directions serialise even when asyncEngineCount == 2.
++    cudaStream_t             streams_h2d[GGML_CUDA_MAX_DEVICES]; // non-blocking
+     ggml_cuda_ar_event_slot  ev_pool[GGML_CUDA_MAX_DEVICES][GGML_CUDA_AR_POOL_SIZE];
+ 
+     // Copy-engine: per-device "I finished reading my peer's host_large"
+@@ -428,6 +445,10 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
+     // byte threshold to opt out for small tensors.
+     p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
++    // GGML_CUDA_AR_HOSTSYNC=1 (opt-in): cross-device ordering on the copy-engine path goes through the host
++    // (cudaEventSynchronize) instead of cross-device cudaStreamWaitEvent. For a GPU without PCIe atomics if the
++    // cross-device waits ever misbehave; costs ~2% of prompt reading on two MI25s.
++    p->hostsync         = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HOSTSYNC", 0) != 0;
+     for (size_t i = 0; i < n_devices; ++i) {
+         p->devices[i] = devices[i];
+     }
+@@ -437,7 +458,18 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+         ggml_cuda_set_device(p->devices[i]);
+ 
+         cudaStream_t stream = nullptr;
+-        if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
++        // AR streams at the highest priority so their work is not queued behind compute; GGML_CUDA_AR_HIPRIO=0 restores
++        // the default priority.
++        int prio_lo = 0, prio_hi = 0;
++        const char * hp_env = getenv("GGML_CUDA_AR_HIPRIO");
++        const bool hiprio = !hp_env || atoi(hp_env) != 0;
++        if (hiprio) {
++            CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi));
++            if (i == 0) {
++                GGML_LOG_INFO("%s: AllReduce streams at priority %d (range %d..%d, GGML_CUDA_AR_HIPRIO)\n", __func__, prio_hi, prio_lo, prio_hi);
++            }
++        }
++        if (cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, hiprio ? prio_hi : prio_lo) != cudaSuccess) {
+             GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags failed for device %d\n",
+                            __func__, p->devices[i]);
+             ggml_cuda_ar_pipeline_free(p);
+@@ -445,6 +477,15 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+         }
+         p->streams[i] = stream;
+ 
++        cudaStream_t stream_h2d = nullptr;
++        if (cudaStreamCreateWithFlags(&stream_h2d, cudaStreamNonBlocking) != cudaSuccess) {
++            GGML_LOG_ERROR("%s: cudaStreamCreateWithFlags (h2d) failed for device %d\n",
++                           __func__, p->devices[i]);
++            ggml_cuda_ar_pipeline_free(p);
++            return nullptr;
++        }
++        p->streams_h2d[i] = stream_h2d;
++
+         for (int s = 0; s < GGML_CUDA_AR_POOL_SIZE; ++s) {
+             bool ok =
+                 cudaEventCreateWithFlags(&p->ev_pool[i][s].app, cudaEventDisableTiming) == cudaSuccess &&
+@@ -528,8 +569,8 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
+     }
+ 
+     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
+-                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
+-                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
++                  "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU, host-ordered copies %s\n",
++                  __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20, p->hostsync ? "on" : "off");
+ 
+     return p;
+ }
+@@ -545,6 +586,10 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
+             ggml_cuda_set_device(p->devices[i]);
+             cudaStreamSynchronize(p->streams[i]);
+         }
++        if (p->streams_h2d[i]) {
++            ggml_cuda_set_device(p->devices[i]);
++            cudaStreamSynchronize(p->streams_h2d[i]);
++        }
+     }
+ 
+     for (int i = 0; i < p->n_devices; ++i) {
+@@ -575,6 +620,10 @@ void ggml_cuda_ar_pipeline_free(ggml_cuda_ar_pipeline * p) {
+             ggml_cuda_set_device(p->devices[i]);
+             cudaStreamDestroy(p->streams[i]);
+         }
++        if (p->streams_h2d[i]) {
++            ggml_cuda_set_device(p->devices[i]);
++            cudaStreamDestroy(p->streams_h2d[i]);
++        }
+     }
+     p->arrival.free();
+     delete p;
+@@ -626,7 +675,11 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
+         // No-op on the first AR -- no prior record exists.
+         if (p->host_large_read_done_valid) {
+             const int peer = 1 - i;
+-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
++            if (p->hostsync) {
++                CUDA_CHECK(cudaEventSynchronize(p->host_large_read_done[peer]));
++            } else {
++                CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->host_large_read_done[peer]));
++            }
+         }
+ 
+         if (!compute[i]) {
+@@ -647,41 +700,76 @@ static bool ggml_cuda_ar_allreduce_copy_impl(
+ 
+     // Stage 2: each GPU waits for each peer D2H chunk, pulls that chunk back to
+     // local device scratch (dev_tmp), then performs one device-local add over
+-    // the assembled peer tensor.  The H2Ds run on the AR stream (copy engine)
+-    // and the add_kernel runs on the caller's compute stream, so the AR stream
+-    // stays pure-copy and avoids an in-stream copy->compute engine switch every
+-    // AR.  dev_tmp is single-buffered: the AR stream waits cross-stream on the
+-    // prior AR's add_kernel-done event before overwriting it.
+-    for (int i = 0; i < 2; ++i) {
+-        const int peer = 1 - i;
+-        ggml_cuda_set_device(p->devices[i]);
+-
+-        // Wait for the previous AR's add_kernel (on the compute stream) to
+-        // finish reading dev_tmp before our H2D overwrites it.  No-op on the
+-        // first copy_impl call.
+-        if (p->dev_tmp_kernel_done_valid) {
+-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->dev_tmp_kernel_done[i]));
++    // the assembled peer tensor.  The H2Ds run on their own stream
++    // (streams_h2d), so chunk c's H2D overlaps our chunk c+1 D2H on the second
++    // copy engine; every ordering the old single stream gave implicitly is
++    // either unnecessary (stage 1 and stage 2 touch disjoint buffers) or kept
++    // by an explicit event.  The add_kernel runs on the caller's compute
++    // stream.  dev_tmp is single-buffered: the H2D stream waits cross-stream on
++    // the prior AR's add_kernel-done event before overwriting it.
++    if (p->hostsync) {
++        // Host-ordered H2Ds: the host waits for each peer chunk to land, then queues its copy. Both directions advance
++        // chunk by chunk; no stream waits on the other device's event.
++        for (int i = 0; i < 2; ++i) {
++            ggml_cuda_set_device(p->devices[i]);
++            if (p->dev_tmp_kernel_done_valid) {
++                CUDA_CHECK(cudaStreamWaitEvent(p->streams_h2d[i], p->dev_tmp_kernel_done[i]));
++            }
+         }
+-
+         for (size_t c = 0; c < copy_chunks; ++c) {
+             const size_t offset = c * chunk_bytes;
+             const size_t this_bytes = (nbytes - offset) < chunk_bytes ?
+                 (nbytes - offset) : chunk_bytes;
++            for (int i = 0; i < 2; ++i) {
++                const int peer = 1 - i;
++                CUDA_CHECK(cudaEventSynchronize(p->ev_pool[peer][slot].cpy[c]));
++                ggml_cuda_set_device(p->devices[i]);
++                CUDA_CHECK(cudaMemcpyAsync(
++                    p->dev_tmp[i] + offset, p->host_large[peer].host + offset, this_bytes,
++                    cudaMemcpyHostToDevice, p->streams_h2d[i]));
++            }
++        }
++    }
++    for (int i = 0; i < 2; ++i) {
++        const int peer = 1 - i;
++        ggml_cuda_set_device(p->devices[i]);
++        cudaStream_t h2d_stream = p->streams_h2d[i];
++
++        if (!p->hostsync) {
++            // Wait for the previous AR's add_kernel (on the compute stream) to
++            // finish reading dev_tmp before our H2D overwrites it.  No-op on the
++            // first copy_impl call.
++            if (p->dev_tmp_kernel_done_valid) {
++                CUDA_CHECK(cudaStreamWaitEvent(h2d_stream, p->dev_tmp_kernel_done[i]));
++            }
+ 
+-            CUDA_CHECK(cudaStreamWaitEvent(p->streams[i], p->ev_pool[peer][slot].cpy[c]));
+-            CUDA_CHECK(cudaMemcpyAsync(
+-                p->dev_tmp[i] + offset, p->host_large[peer].host + offset, this_bytes,
+-                cudaMemcpyHostToDevice, p->streams[i]));
++            for (size_t c = 0; c < copy_chunks; ++c) {
++                const size_t offset = c * chunk_bytes;
++                const size_t this_bytes = (nbytes - offset) < chunk_bytes ?
++                    (nbytes - offset) : chunk_bytes;
++
++                CUDA_CHECK(cudaStreamWaitEvent(h2d_stream, p->ev_pool[peer][slot].cpy[c]));
++                CUDA_CHECK(cudaMemcpyAsync(
++                    p->dev_tmp[i] + offset, p->host_large[peer].host + offset, this_bytes,
++                    cudaMemcpyHostToDevice, h2d_stream));
++            }
+         }
+ 
+         // Mark our reads of host_large[peer] complete so peer's next AR can
+         // safely overwrite it.
+-        CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], p->streams[i]));
++        CUDA_CHECK(cudaEventRecord(p->host_large_read_done[i], h2d_stream));
+ 
+-        // Hand off from AR stream (copy engine) to compute stream: compute
+-        // stream waits for all H2Ds to finish, then runs the add_kernel.
+-        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, p->streams[i]));
++        // Hand off from the H2D stream to the compute stream: compute stream
++        // waits for all H2Ds to finish, then runs the add_kernel.
++        CUDA_CHECK(cudaEventRecord(p->ev_pool[i][slot].h2d, h2d_stream));
+         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].h2d));
++        // With H2D on its own stream, the h2d event no longer implies that OUR
++        // stage-1 D2H has finished reading src_buf[i].  The add kernel writes
++        // dst_buf[i] (== src_buf[i] on the non-BF16 path), and on the BF16 path
++        // src_buf[i] is a pool buffer the compute stream may reuse as soon as
++        // this call returns, so wait for our own D2H as well.  Chunks are in
++        // order on streams[i]; the last chunk's event covers all of them.
++        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx[i]->stream(), p->ev_pool[i][slot].cpy[copy_chunks - 1]));
+ 
+         const int block_size = 256;
+         int n_blocks = (int) ((ne + block_size - 1) / block_size);
+@@ -952,11 +1040,9 @@ bool ggml_cuda_ar_allreduce(
+     return ok;
+ }
+ 
+-#else // defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
++#else // defined(GGML_USE_MUSA)
+ 
+-// HIP and MUSA lack the host-mapped pinned-memory APIs (cudaHostAllocPortable
+-// / cudaHostAllocMapped / cudaHostGetDevicePointer) and __nanosleep that this
+-// implementation relies on, so the internal AllReduce is a CUDA-only feature.
++// MUSA lacks the host-mapped pinned-memory APIs this implementation relies on.
+ // The dispatcher in ggml-cuda.cu treats a nullptr pipeline as "init failed"
+ // and silently falls back to the meta backend's generic AllReduce.
+ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int *, size_t) {
+@@ -968,4 +1054,4 @@ bool ggml_cuda_ar_allreduce(ggml_cuda_ar_pipeline *, ggml_backend_t *, ggml_tens
+     return false;
+ }
+ 
+-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
++#endif // !defined(GGML_USE_MUSA)

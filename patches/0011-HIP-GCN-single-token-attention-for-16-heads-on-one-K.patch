@@ -1,0 +1,353 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 01:27:28 -0600
+Subject: [PATCH 11/19] HIP GCN: single-token attention for 16 heads on one KV
+ head
+
+Gemma 4's global layers (D512, 16 heads per KV head): one pass over K and V, wave = 4 heads, lane = 8
+dims, 4-key batches, own combine. MI25 at 4k / 20k: 74 / 219 us (tile 110 / 283); Gemma 4 12B at 20k
+writes 32.8 t/s (tile 31.7). GGML_CUDA_FA_GCN_MQA=0 goes back to the tile kernel.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ ggml/src/ggml-cuda/fattn-gcn.cu | 315 +++++++++++++++++++++++++++++++-
+ 1 file changed, 313 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-gcn.cu b/ggml/src/ggml-cuda/fattn-gcn.cu
+index 43f6c49ce..0a92d85fa 100644
+--- a/ggml/src/ggml-cuda/fattn-gcn.cu
++++ b/ggml/src/ggml-cuda/fattn-gcn.cu
+@@ -389,6 +389,311 @@ static void fattn_gcn_decode_launch(ggml_backend_cuda_context & ctx, ggml_tensor
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++// Single-token attention for many query heads on one KV head (Gemma 4 12B's global layers: D512, 16 heads), f16 cache.
++// A block takes a contiguous run of keys for all G heads, reading each K and V row once as a coalesced 1 KB load:
++// wave w owns heads 4w..4w+3, lane l dims 8l..8l+7. Keys go 4 at a time - 16 partial dot products a lane, summed
++// across the wave by recursive halving (17 exchanges for 16 sums) - with an online softmax; values are accumulated in
++// packed f16 per batch and folded into f32. 64-key runs the mask hides completely are skipped from one ballot.
++static constexpr int fattn_gcn_mqa_nthreads = 256;
++
++// An empty asm that makes x opaque: without it the compiler turns `hi ? d[i] : d[i + 8]` into "element (hi ? i : i + 8)
++// of d" and builds that from 16 compares and selects - ~600 instructions a batch instead of ~30.
++static __device__ __forceinline__ void fattn_gcn_opaque(float & x) {
++    asm volatile("" : "+v"(x));
++}
++
++// One step of a recursive-halving sum across the wave: a lane keeps the half of its 2N values its lane bit selects and
++// adds the partner's copy of that half.
++template <int N, int BIT>
++static __device__ __forceinline__ void fattn_gcn_halve(const float (&src)[2*N], float (&dst)[N], const int lane) {
++    const bool hi = lane & BIT;
++#pragma unroll
++    for (int i = 0; i < N; ++i) {
++        float lo_v = src[i], hi_v = src[i + N];
++        fattn_gcn_opaque(lo_v);
++        fattn_gcn_opaque(hi_v);
++        dst[i] = (hi ? hi_v : lo_v) + __shfl_xor(hi ? lo_v : hi_v, BIT, 64);
++    }
++}
++
++template <int D, int G, int NB>
++__launch_bounds__(fattn_gcn_mqa_nthreads, NB <= 2 ? 3 : 2)
++static __global__ void fattn_gcn_decode_mqa(
++        const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
++        const half * __restrict__ mask, float * __restrict__ parts, float2 * __restrict__ meta,
++        const float scale, const float softcap, const int n_kv, const int span, const int HQ,
++        const int64_t nbq2, const int64_t nbk1, const int64_t nbk2, const int64_t nbv1, const int64_t nbv2) {
++    static_assert(D == 64*8 && G == 16, "one lane per 8 dims, one wave per 4 heads");
++    constexpr int HW = 4;                              // heads per wave; NB keys per batch
++    constexpr int NV = HW*NB;                          // partial sums a lane holds per batch
++    constexpr int SH = NV == 16 ? 2 : 3;               // after the sum, value v sits in lanes v << SH ..
++    constexpr int SU = NB == 4 ? 2 : 1;                // log2(NB)
++    static_assert(NV == 16 || NV == 8, "4 or 2 keys a batch");
++
++    const int lane = threadIdx.x % 64;
++    const int wave = threadIdx.x / 64;
++    const int part = blockIdx.x;
++    const int hkv  = blockIdx.y;
++    const int hq0  = hkv*G + wave*HW;
++    const int kbeg = part*span;
++    const int kend = min(kbeg + span, n_kv);
++
++    // queries in shared memory, scaled, in f16 (in registers they pushed the kernel past 128 and into scratch)
++    __shared__ uint4 q_s[G][D/8];
++    for (int i = threadIdx.x; i < G*D/8; i += fattn_gcn_mqa_nthreads) {
++        const int g = i / (D/8);
++        const float4 * qp = (const float4 *) (Q + (int64_t) (hkv*G + g)*nbq2) + (i % (D/8))*2;
++        const float4 a = qp[0], b = qp[1];
++        const half2 h0 = make_half2(a.x*scale, a.y*scale), h1 = make_half2(a.z*scale, a.w*scale);
++        const half2 h2 = make_half2(b.x*scale, b.y*scale), h3 = make_half2(b.z*scale, b.w*scale);
++        uint4 w;
++        memcpy(&w.x, &h0, 4); memcpy(&w.y, &h1, 4); memcpy(&w.z, &h2, 4); memcpy(&w.w, &h3, 4);
++        q_s[g][i % (D/8)] = w;
++    }
++    __syncthreads();
++
++    float o[HW][8];
++    float m[HW], l[HW];
++#pragma unroll
++    for (int h = 0; h < HW; ++h) {
++        m[h] = -FLT_MAX / 2.0f;
++        l[h] = 0.0f;
++#pragma unroll
++        for (int j = 0; j < 8; ++j) {
++            o[h][j] = 0.0f;
++        }
++    }
++
++    const char * kbase = K + (int64_t) hkv*nbk2 + lane*16;
++    const char * vbase = V + (int64_t) hkv*nbv2 + lane*16;
++
++    for (int k64 = kbeg; k64 < kend; k64 += 64) {
++        // one mask value a lane; the ballot says which keys of this run are visible
++        const int   kl = k64 + lane;
++        const float mv = kl < kend ? __half2float(mask[kl]) : -INFINITY;
++        const uint64_t live = __ballot(mv != -INFINITY);
++        if (live == 0) {
++            continue;
++        }
++        for (int b = 0; b < 64; b += NB) {
++            if (((live >> b) & ((1ull << NB) - 1)) == 0) {
++                continue;
++            }
++            uint4 kv[NB];
++#pragma unroll
++            for (int u = 0; u < NB; ++u) {
++                kv[u] = *(const uint4 *) (kbase + (int64_t) min(k64 + b + u, kend - 1)*nbk1);
++            }
++
++            // partial dot products over this lane's 8 dims: d[h*NB + u]
++            float d[HW*NB];
++#pragma unroll
++            for (int h = 0; h < HW; ++h) {
++                const uint4 qw = q_s[wave*HW + h][lane];
++#pragma unroll
++                for (int u = 0; u < NB; ++u) {
++                    half2 a = __hmul2(fattn_gcn_h2(kv[u].x), fattn_gcn_h2(qw.x));
++                    a = __hfma2(fattn_gcn_h2(kv[u].y), fattn_gcn_h2(qw.y), a);
++                    a = __hfma2(fattn_gcn_h2(kv[u].z), fattn_gcn_h2(qw.z), a);
++                    a = __hfma2(fattn_gcn_h2(kv[u].w), fattn_gcn_h2(qw.w), a);
++                    d[h*NB + u] = __half2float(__hadd(__low2half(a), __high2half(a)));
++                }
++            }
++            // the V rows load while the sums and the softmax run
++            uint4 vv[NB];
++#pragma unroll
++            for (int u = 0; u < NB; ++u) {
++                vv[u] = *(const uint4 *) (vbase + (int64_t) min(k64 + b + u, kend - 1)*nbv1);
++            }
++            // sum over the 64 lanes by recursive halving: afterwards lane l holds the full sum of value (l >> SH) % NV
++            float d1;
++            if constexpr (NV == 16) {
++                float d8[8], d4[4], d2[2], d1a[1];
++                fattn_gcn_halve<8, 32>(d, d8, lane);
++                fattn_gcn_halve<4, 16>(d8, d4, lane);
++                fattn_gcn_halve<2, 8>(d4, d2, lane);
++                fattn_gcn_halve<1, 4>(d2, d1a, lane);
++                d1 = d1a[0];
++            } else {
++                float d4[4], d2[2], d1a[1];
++                fattn_gcn_halve<4, 32>(d, d4, lane);
++                fattn_gcn_halve<2, 16>(d4, d2, lane);
++                fattn_gcn_halve<1, 8>(d2, d1a, lane);
++                d1 = d1a[0] + __shfl_xor(d1a[0], 4, 64);
++            }
++            d1 += __shfl_xor(d1, 2, 64);
++            d1 += __shfl_xor(d1, 1, 64);
++
++            // lane l holds the dot of head (l >> 4) & 3 with key (l >> 2) & 3 of the batch (4 lanes agree): each lane
++            // takes the exponential of its own score only, in log2 units so it is one instruction
++            const int u_l = (lane >> SH) & (NB - 1);
++            const int h_l = (lane >> (SH + SU)) & (HW - 1);
++            float x = d1;
++            if (softcap != 0.0f) {
++                x = softcap * tanhf(x);
++            }
++            x = (x + __shfl(mv, b + u_l, 64)) * 1.4426950409f;
++            float mb = x;                                        // the batch's max per head over its NB keys
++#pragma unroll
++            for (int k = 0; k < SU; ++k) {
++                mb = fmaxf(mb, __shfl_xor(mb, 1 << (SH + k), 64));
++            }
++            float c[HW];
++            float m_l = 0.0f;
++#pragma unroll
++            for (int h = 0; h < HW; ++h) {
++                const float mn = fmaxf(m[h], __shfl(mb, h << (SH + SU), 64));
++                c[h] = exp2f(m[h] - mn);
++                m[h] = mn;
++                m_l  = h == h_l ? mn : m_l;
++            }
++            const float p_l = exp2f(x - m_l);
++            float ps = p_l;
++#pragma unroll
++            for (int k = 0; k < SU; ++k) {
++                ps += __shfl_xor(ps, 1 << (SH + k), 64);
++            }
++
++#pragma unroll
++            for (int h = 0; h < HW; ++h) {
++                l[h] = l[h]*c[h] + __shfl(ps, h << (SH + SU), 64);
++                half2 a16[4];
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    a16[i] = make_half2(0.0f, 0.0f);
++                }
++#pragma unroll
++                for (int u = 0; u < NB; ++u) {
++                    const half2 p2 = __float2half2_rn(__shfl(p_l, (h*NB + u) << SH, 64));
++                    a16[0] = __hfma2(fattn_gcn_h2(vv[u].x), p2, a16[0]);
++                    a16[1] = __hfma2(fattn_gcn_h2(vv[u].y), p2, a16[1]);
++                    a16[2] = __hfma2(fattn_gcn_h2(vv[u].z), p2, a16[2]);
++                    a16[3] = __hfma2(fattn_gcn_h2(vv[u].w), p2, a16[3]);
++                }
++#pragma unroll
++                for (int i = 0; i < 4; ++i) {
++                    const float2 f = __half22float2(a16[i]);
++                    o[h][2*i + 0] = o[h][2*i + 0]*c[h] + f.x;
++                    o[h][2*i + 1] = o[h][2*i + 1]*c[h] + f.y;
++                }
++            }
++        }
++    }
++
++#pragma unroll
++    for (int h = 0; h < HW; ++h) {
++        const int64_t row = (int64_t) part*HQ + hq0 + h;
++        float4 * out = (float4 *) (parts + row*D + lane*8);           // zeros when no key was visible
++        out[0] = make_float4(o[h][0], o[h][1], o[h][2], o[h][3]);
++        out[1] = make_float4(o[h][4], o[h][5], o[h][6], o[h][7]);
++        if (lane == 0) {
++            meta[row] = make_float2(m[h], l[h]);
++        }
++    }
++}
++
++// The parts of fattn_gcn_decode_mqa for one head and 64 dims: each part's weight computed once into shared memory, the
++// parts split over 4 groups of 64 threads with 8 loads in flight each, the 4 sums added in a fixed order. A part with a
++// zero sum saw no visible key (its output is zeros) and gets weight 0.
++template <int D>
++__launch_bounds__(256, 1)
++static __global__ void fattn_gcn_combine_mqa(
++        const float * __restrict__ parts, const float2 * __restrict__ meta, float * __restrict__ dst, const int nparts, const int HQ) {
++    const int head = blockIdx.x;
++    const int t    = threadIdx.x % 64;
++    const int grp  = threadIdx.x / 64;
++    const int dim  = blockIdx.y*64 + t;
++    extern __shared__ float2 wsh[];                    // per part: (weight, weight * sum), meta read once
++    __shared__ float red[4][2][64];
++    __shared__ float M_s;
++
++    for (int i = threadIdx.x; i < nparts; i += 256) {
++        wsh[i] = meta[(int64_t) i*HQ + head];
++    }
++    __syncthreads();
++    if (threadIdx.x < 64) {
++        float M = -FLT_MAX / 2.0f;
++        for (int i = t; i < nparts; i += 64) {
++            if (wsh[i].y > 0.0f) {
++                M = fmaxf(M, wsh[i].x);
++            }
++        }
++        M = warp_reduce_max<64>(M);
++        if (t == 0) {
++            M_s = M;
++        }
++    }
++    __syncthreads();
++    for (int i = threadIdx.x; i < nparts; i += 256) {
++        const float2 v = wsh[i];
++        const float  w = v.y > 0.0f ? exp2f(v.x - M_s) : 0.0f;    // maxima are in log2 units
++        wsh[i] = make_float2(w, w*v.y);
++    }
++    __syncthreads();
++
++    constexpr int NB = 8;
++    float num = 0.0f;
++    float den = 0.0f;
++    for (int i0 = grp*NB; i0 < nparts; i0 += 4*NB) {
++        float v[NB];
++#pragma unroll
++        for (int u = 0; u < NB; ++u) {
++            v[u] = parts[((int64_t) min(i0 + u, nparts - 1)*HQ + head)*D + dim];
++        }
++#pragma unroll
++        for (int u = 0; u < NB; ++u) {
++            if (i0 + u < nparts) {
++                const float2 w = wsh[i0 + u];
++                num += w.x * v[u];
++                den += w.y;
++            }
++        }
++    }
++    red[grp][0][t] = num;
++    red[grp][1][t] = den;
++    __syncthreads();
++    if (grp == 0) {
++        num = red[0][0][t] + red[1][0][t] + red[2][0][t] + red[3][0][t];
++        den = red[0][1][t] + red[1][1][t] + red[2][1][t] + red[3][1][t];
++        dst[(int64_t) head*D + dim] = den > 0.0f ? num / den : 0.0f;
++    }
++}
++
++template <int D, int G, int NB>
++static void fattn_gcn_decode_mqa_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * Q    = dst->src[0];
++    const ggml_tensor * K    = dst->src[1];
++    const ggml_tensor * V    = dst->src[2];
++    const ggml_tensor * mask = dst->src[3];
++    cudaStream_t stream = ctx.stream();
++
++    float scale = 1.0f, softcap = 0.0f;
++    memcpy(&scale,   (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&softcap, (const float *) dst->op_params + 2, sizeof(float));
++    if (softcap != 0.0f) {
++        scale /= softcap;
++    }
++    const int n_kv = K->ne[1];
++    const int hkv  = K->ne[2];
++    const int HQ   = Q->ne[2];
++    // two blocks a CU, the same number of keys each (a multiple of the 4-key batch: whole 64-key runs left 21 of 64
++    // CUs with one block at 20k)
++    const int nsm    = ggml_cuda_info().devices[ctx.device].nsm;
++    const int nblk   = (NB <= 2 ? 3 : 2)*nsm;
++    const int span   = ((n_kv + nblk - 1) / nblk + 3) / 4 * 4;
++    const int nparts = (n_kv + span - 1) / span;
++
++    ggml_cuda_pool_alloc<float>  parts(ctx.pool(), (size_t) nparts*HQ*D);
++    ggml_cuda_pool_alloc<float2> meta (ctx.pool(), (size_t) nparts*HQ);
++    fattn_gcn_decode_mqa<D, G, NB><<<dim3(nparts, hkv, 1), fattn_gcn_mqa_nthreads, 0, stream>>>(
++        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const half *) mask->data,
++        parts.get(), meta.get(), scale, softcap, n_kv, span, HQ, Q->nb[2], K->nb[1], K->nb[2], V->nb[1], V->nb[2]);
++    CUDA_CHECK(cudaGetLastError());
++    fattn_gcn_combine_mqa<D><<<dim3(HQ, D/64, 1), 256, nparts*sizeof(float2), stream>>>(
++        parts.get(), meta.get(), (float *) dst->data, nparts, HQ);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ bool ggml_cuda_fattn_gcn_decode_try(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     static const bool enabled = [] { const char * e = getenv("GGML_CUDA_FA_GCN_DECODE"); return !e || atoi(e) != 0; }();
+     static const int  skip    = [] { const char * e = getenv("GGML_CUDA_FA_GCN_SKIP");   return !e || atoi(e) != 0; }();
+@@ -415,12 +720,18 @@ bool ggml_cuda_fattn_gcn_decode_try(ggml_backend_cuda_context & ctx, ggml_tensor
+     GGML_UNUSED(V);
+     // 64 keys a block: Gemma 4 12B writes 31.6 t/s at 20k vs 31.3 at 128 and 29.9 at 256 (36.1 / 35.7 / 33.8 short).
+     const int C = 64;
+-    // (D512 x 16, Gemma's global layers: 541 vs the tile kernel's 311 us at 20k - per-lane K rows read at 74 GB/s,
+-    // every wave re-reading V, and a 160-part combine - so those stay on the tile kernel.)
++    // D512 x 16 (Gemma's global layers) goes to fattn_gcn_decode_mqa: 77.9 / 223 us at 4k / 20k vs the tile kernel's
++    // 110 / 283; Gemma writes 32.8 t/s at 20k vs 31.7. (This kernel at D512 was 541 us: per-lane K rows read at 74 GB/s.)
+     if (D == 256 && G == 2) {
+         fattn_gcn_decode_launch<256, 2>(ctx, dst, C, skip);
+         return true;
+     }
++    static const bool mqa = [] { const char * e = getenv("GGML_CUDA_FA_GCN_MQA"); return !e || atoi(e) != 0; }();
++    if (mqa && D == 512 && G == 16 && Q->nb[2] % 16 == 0 && ((uintptr_t) Q->data) % 16 == 0) {
++        // 4 keys a batch: 2 (82 registers, 3 waves a SIMD instead of 2) was slower, 277 vs 224 us at 20k
++        fattn_gcn_decode_mqa_launch<512, 16, 4>(ctx, dst);
++        return true;
++    }
+     return false;
+ }
+ #endif // !defined(GGML_USE_HIP)

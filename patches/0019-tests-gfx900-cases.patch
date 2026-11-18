@@ -1,0 +1,356 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 19:28:08 -0600
+Subject: [PATCH 19/19] tests: gfx900 cases
+
+test-backend-ops correctness and perf cases for the changes above: GCN matvec shapes, the tile kernel's
+quantized-cache shapes (GQA 6 per card under tensor split), single-token and windowed attention, GEMM
+attention prompt shapes, get_rows/concat layouts. GGML_TEST_PRINT_ERR=1 also prints the error of
+passing cases.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ tests/test-backend-ops.cpp | 280 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 280 insertions(+)
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b28bc29ef..3092a78c4 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1472,6 +1472,10 @@ struct test_case {
+             }
+ 
+             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
++            static const bool print_err = getenv("GGML_TEST_PRINT_ERR") != nullptr;   // print the error of passing cases too
++            if (print_err) {
++                printf("[%s] err = %.3e ", ggml_op_desc(t1), err);
++            }
+             if (err > ud->tc->max_err(ud->backend1)) {
+                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+                 //for (int i = 0; i < (int) f1.size(); i++) {
+@@ -6150,6 +6154,33 @@ struct test_concat : public test_case {
+     }
+ };
+ 
++// CONCAT along dim 0 of a contiguous state and a transposed view - Qwen3.5's linear-attention conv
++// state (3 x 8192) joined with the new tokens (the ssm_conv input), which takes concat_dim0_transpose_u32
++struct test_concat_state_t : public test_case {
++    const int64_t n_state;
++    const int64_t n_tok;
++    const int64_t n_ch;
++
++    std::string vars() override {
++        return VARS_TO_STR3(n_state, n_tok, n_ch);
++    }
++
++    test_concat_state_t(int64_t n_state = 3, int64_t n_tok = 3, int64_t n_ch = 8192)
++        : n_state(n_state), n_tok(n_tok), n_ch(n_ch) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state, n_ch);
++        ggml_set_name(a, "a");
++        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ch, n_tok);
++        ggml_set_name(x, "x");
++        ggml_tensor * b = ggml_transpose(ctx, x);
++        ggml_set_name(b, "x_t");
++        ggml_tensor * out = ggml_concat(ctx, a, b, 0);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_ARGSORT
+ struct test_argsort : public test_case {
+     const ggml_type type;
+@@ -7293,6 +7324,65 @@ struct test_flash_attn_ext : public test_case {
+     }
+ };
+ 
++// single-token attention under a sliding window - only keys w0 .. w0+wn (mod kv) are visible, the way
++// a token sees its 1024 of the window layers' ring of cells.
++struct test_flash_attn_ext_window : public test_flash_attn_ext {
++    const int64_t w0;
++    const int64_t wn;
++
++    std::string vars() override {
++        return test_flash_attn_ext::vars() + "," + VARS_TO_STR2(w0, wn);
++    }
++
++    test_flash_attn_ext_window(int64_t hs, int64_t nh, int64_t nr, int64_t kv, int64_t w0, int64_t wn,
++                               std::array<int32_t, 4> permute = {0, 1, 2, 3})
++        : test_flash_attn_ext(hs, hs, nh, {nr, 1}, kv, 1, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, permute),
++          w0(w0), wn(wn) {}
++
++    void initialize_tensors(ggml_context * ctx) override {
++        test_flash_attn_ext::initialize_tensors(ctx);
++        ggml_tensor * m = ggml_get_tensor(ctx, "m");
++        std::vector<ggml_fp16_t> data(ggml_nelements(m), ggml_fp32_to_fp16(-INFINITY));
++        for (int64_t i = 0; i < wn; ++i) {
++            data[(w0 + i) % kv] = ggml_fp32_to_fp16(0.0f);
++        }
++        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
++    }
++};
++
++// prompt reading under a causal sliding window - nb new tokens are the last nb of kv cells (token j sits
++// at kv - nb + j) and each sees the win cells up to itself, as Gemma 4's window layers do while reading a prompt.
++struct test_flash_attn_ext_swa_prefill : public test_flash_attn_ext {
++    const int64_t win;
++
++    std::string vars() override {
++        return test_flash_attn_ext::vars() + "," + VARS_TO_STR1(win);
++    }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2 * nh*nr23[0] * nb * (hsk + hsv) * std::min<int64_t>(win, kv);   // the visible keys only
++    }
++
++    test_flash_attn_ext_swa_prefill(int64_t hs, int64_t nh, int64_t nr, int64_t kv, int64_t nb, int64_t win)
++        : test_flash_attn_ext(hs, hs, nh, {nr, 1}, kv, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
++                              {0, 2, 1, 3}),
++          win(win) {}
++
++    void initialize_tensors(ggml_context * ctx) override {
++        test_flash_attn_ext::initialize_tensors(ctx);
++        ggml_tensor * m = ggml_get_tensor(ctx, "m");
++        std::vector<ggml_fp16_t> data(ggml_nelements(m), ggml_fp32_to_fp16(-INFINITY));
++        for (int64_t j = 0; j < nb; ++j) {
++            const int64_t pos = kv - nb + j;
++            for (int64_t k = std::max<int64_t>(0, pos - win + 1); k <= pos; ++k) {
++                data[j*kv + k] = ggml_fp32_to_fp16(0.0f);
++            }
++        }
++        ggml_backend_tensor_set(m, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
++    }
++};
++
+ // GGML_OP_CROSS_ENTROPY_LOSS
+ struct test_cross_entropy_loss : public test_case {
+     const ggml_type type;
+@@ -8402,6 +8492,88 @@ static const ggml_type other_types[] = {
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++
++    // the live per-card decode/verify attention shape (GQA 6, D 256, K q8_0 / V q4_0 and
++    // q4_0 / q4_0) at depths the CPU reference can check quickly; exercises the q8_0-K direct tile path at nb >= 3.
++    for (ggml_type tk : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++        for (int64_t kv : {512, 1024, 4096}) {
++            for (int64_t nb : {1, 2, 3, 4, 5}) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0.0f, 0.0f,
++                                                                GGML_PREC_F32, tk, GGML_TYPE_Q4_0));
++            }
++        }
++    }
++    // the GCN q6_K matvec (mmvq-gcn.cu) - row tails (37 rows), rows of 3 and 15 blocks (lanes past the end
++    // idle), 1-3 columns (4 takes the generic kernel), and fused with a gate + GLU at one column (2: generic).
++    for (int64_t n : {1, 2, 3, 4}) {
++        for (int64_t k : {768, 3840, 4096}) {   // 3840: Gemma 4 12B's output head, 15 blocks a row
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 37, n, k, {1, 1}, {1, 1}));
++        }
++    }
++    for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
++        for (int64_t m : {1, 2}) {
++            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, glu_op, m, 64, 4096,
++                                                                false, 1, 1, false, false, true, false, {1, 1}));
++        }
++    }
++
++    // 27B prompt attention through the GEMM path (GGML_CUDA_FA_GEMM=1): 24 query heads over 4 KV
++    // heads, D 256, K q8_0 / V q4_0 cache, past the path's 4096-cell / 128-token floor
++    for (int64_t nb : {128, 300}) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4608, nb, true, false, 0.0f, 0.0f,
++                                                        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
++    }
++
++    // GET_ROWS rows long enough for the vectorized path (64-thread blocks on GCN), Qwen3.5's 2 MB state row
++    for (int n : {32768, 32772, 524288}) {
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, n, 4, 2, 1, 1, false));
++        test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, n, 4, 1, 2, 1, false));
++    }
++
++    // Qwen3.5's conv-state concat (contiguous state + transposed tokens, dim 0), and odd sizes
++    for (auto [st, tok, ch] : std::vector<std::tuple<int, int, int>>{{3, 1, 8192}, {3, 2, 8192}, {3, 3, 8192}, {3, 4, 8192},
++                                                                      {4, 3, 1000}, {1, 33, 77}, {8, 5, 4096}}) {
++        test_cases.emplace_back(new test_concat_state_t(st, tok, ch));
++    }
++
++    // the GCN single-token f16 attention (fattn-gcn.cu) at Gemma 4 12B's shapes - D512 x 16 heads on 1 KV
++    // head, D256 x 2 on 8 - with key counts that end mid-block, 64/128/256-key blocks, and a logit softcap.
++    for (float softcap : {0.0f, 30.0f}) {
++        for (int64_t kv : {96, 1000, 4096, 20480}) {
++            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, 1, true, false, 0.0f, softcap,
++                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++        for (int64_t kv : {96, 1000, 1024, 20480}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, kv, 1, true, false, 0.0f, softcap,
++                                                            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++        }
++    }
++    // the window inside the ring, across its end, starting mid-block, and the whole ring but one key
++    for (auto [kv, w0, wn] : std::vector<std::array<int64_t, 3>>{{7168, 2048, 1024}, {7168, 6656, 1024}, {7168, 3001, 1024},
++                                                                 {7168, 0, 7167}, {1500, 900, 1024}}) {
++        test_cases.emplace_back(new test_flash_attn_ext_window(256, 8, 2, kv, w0, wn));
++        test_cases.emplace_back(new test_flash_attn_ext_window(256, 8, 2, kv, w0, wn, {0, 2, 1, 3}));   // the cache's layout
++    }
++    for (auto [kv, nb] : std::vector<std::array<int64_t, 2>>{{7168, 2048}, {3072, 2048}, {4096, 512}, {1500, 300}}) {
++        test_cases.emplace_back(new test_flash_attn_ext_swa_prefill(256, 8, 2, kv, nb, 1024));
++    }
++    // and Gemma's global layers (D512, 16 heads on 1 KV head) reading with plain causal attention (window = whole cache)
++    for (auto [kv, nb] : std::vector<std::array<int64_t, 2>>{{8192, 256}, {4096, 512}}) {
++        test_cases.emplace_back(new test_flash_attn_ext_swa_prefill(512, 1, 16, kv, nb, kv));
++    }
++
++    // the HIP direct tile read of K q8_0 with V q4_0 (Qwen3.5 9B) or q8_0 (its MTP draft) at GQA 2, 4 and 8
++    // - the ladder's ncols2 arms - from decode through prefill widths.
++    for (ggml_type tv : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0}) {
++        for (int64_t nr : {2, 4, 8}) {
++            for (int64_t kv : {512, 4096}) {
++                for (int64_t nb : {1, 3, 5, 17, 64}) {
++                    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr, 1}, kv, nb, true, false, 0.0f, 0.0f,
++                                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, tv));
++                }
++            }
++        }
++    }
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -10277,6 +10449,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // decode/verify attention of the 27B per card under tensor split - 12 query heads over 2 KV
++    // heads (GQA 6), head size 256, K q8_0 / V q4_0 (live cache) and q4_0 / q4_0 (the direct tile path), 1-5 tokens
++    // at several depths. Filter with -p "hsk=256,hsv=256,nh=2,nr23=\[6,1\]".
++    for (ggml_type tk : {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
++        for (int64_t kv : {4096, 16384, 65536, 131072, 262144}) {
++            for (int64_t nb : {1, 2, 3, 4, 5}) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0.0f, 0.0f,
++                                                                GGML_PREC_F32, tk, GGML_TYPE_Q4_0));   // llama-graph sets F32 on every FA node
++            }
++        }
++    }
++
+     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
+     // note: same bytes either way, so a backend that indexes them differently shows it here
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
+@@ -10451,6 +10635,46 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // Qwen3.5's recurrent-state gather - one 524288-float row (2 MB) of a few
++    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 524288, 4, 1, 1, 1, false));
++    // Gemma 4 12B's window layers reading a prompt - 2048 new tokens, 7168 cells, a 1024-token window
++    test_cases.emplace_back(new test_flash_attn_ext_swa_prefill(256, 8, 2, 7168, 2048, 1024));
++    // 27B writing at 20k - one token, 24 heads on 4 KV heads, K q8_0 / V q4_0, the cache's layout
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 20480, 1, true, false, 0.0f, 0.0f,
++                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
++    // and Qwen3.5 9B's (16 heads on 4 KV heads, same cache types)
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, 20480, 1, true, false, 0.0f, 0.0f,
++                                                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
++    // its global layers reading the last 2048 tokens of a 16384-token prompt (causal)
++    test_cases.emplace_back(new test_flash_attn_ext_swa_prefill(512, 1, 16, 16384, 2048, 16384));
++    // Gemma 4 12B's sliding-window attention at depth - 1024 of the 7168 cells visible, and all of them -
++    // laid out as the cache is (a cell holds all 8 heads)
++    test_cases.emplace_back(new test_flash_attn_ext_window(256, 8, 2, 7168, 3001, 1024, {0, 2, 1, 3}));
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 7168, 1, true, false, 0.0f, 0.0f,
++                                                    GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
++
++    // Qwen3.5's conv-state concat at decode (1) and MTP verify (3)
++    for (int tok : {1, 3}) {
++        test_cases.emplace_back(new test_concat_state_t(3, tok, 8192));
++    }
++
++    // Gemma 4 12B's (q4_0 FFN, its q6_K output head) and Qwen3.5 9B's writing-time matmuls, decode (1)
++    // and MTP verify (2, 3): q6_K FFN, qkv and output head, q8_0 ssm_out, and the f16 MTP layer.
++    for (int bs : {1, 2, 3}) {
++        for (auto [m, k] : std::vector<std::pair<int, int>>{{15360, 3840}, {3840, 15360}, {8192, 3840}}) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
++        }
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 262144, bs, 3840, {1, 1}, {1, 1}));
++    }
++    for (int bs : {1, 2, 3}) {
++        for (auto [type_a, m, k] : std::vector<std::tuple<ggml_type, int, int>>{
++                {GGML_TYPE_Q6_K, 12288, 4096}, {GGML_TYPE_Q6_K, 4096, 12288}, {GGML_TYPE_Q6_K, 8192, 4096},
++                {GGML_TYPE_Q6_K, 248320, 4096}, {GGML_TYPE_Q8_0, 4096, 4096},
++                {GGML_TYPE_F16, 12288, 4096}, {GGML_TYPE_F16, 4096, 12288}}) {
++            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
++        }
++    }
++
+     // qwen3-30b-a3b
+     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
+         for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ2_XS}) {
+@@ -10496,6 +10720,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
+     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
++    // Long-context prefill attention, exactly as one GPU sees it for qwen3.5-27B under
++    // -sm tensor -ctk q4_0 -ctv q4_0 -ub 2048: 2 KV heads, GQA 6 (12 Q heads), D 256.
++    // 16 of the 65 layers carry a growing KV cache (full_attention_interval 4), so a
++    // prefill batch costs 16x one of these. Benchmarking the op directly avoids the ~30
++    // minutes llama-bench spends rebuilding 262144 tokens of context to time one batch.
++    for (int kv : {32768, 65536, 131072, 262144}) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
++    }
++    // Decode shape across the 32-value block quants, to separate "bytes moved" from "work per
++    // value" without a profiler (nvprof metrics need NVreg_RestrictProfilingToAdminUsers=0).
++    // All of these hold 32 values per block, so a call touches the same number of blocks and
++    // values; only the block size and the dequant differ:
++    //     q4_0 18 B (0.5625 B/val)  q4_1 20 B  q5_0 22 B  q5_1 24 B  q8_0 34 B (1.0625)  f16 2 B/val
++    // If time tracks bytes, the kernel is bandwidth-bound. If it is flat across these while
++    // f16 is faster than all of them, the cost is per-value unpacking, not traffic. q8_0 is
++    // the key point: ~2x the bytes of q4_0 with the cheapest dequant (no nibble unpack).
++    for (ggml_type tkv : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
++    }
++
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+@@ -10518,6 +10762,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
++    // Gemma 4 12B's per-token norms: the hidden state (3840) and the per-head q/k norms (256 x 16, 256 x 8),
++    // plain and with the fused weight multiply (+ add).
++    for (std::array<int64_t, 4> ne : std::vector<std::array<int64_t, 4>>{{3840, 1, 1, 1}, {256, 16, 1, 1}, {256, 8, 1, 1}}) {
++        test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, ne, false, 1e-6f));
++        test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, ne, 1e-6f, false));
++    }
++
++    // Gemma 4 12B single-token attention, f16 cache: the global layers (D512, 1 KV head x 16 query heads)
++    // at 4k and 20k, and the sliding-window ones (D256, 8 KV heads x 2) over their 1024-token window.
++    for (int64_t kv : {4096, 20480}) {
++        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {16, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    }
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 8, {2, 1}, 1024, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++
++    // Qwen3.5 9B prefill attention (head 256, 4 KV heads x 4, K q8_0 / V q4_0) at ubatch 512 and 2048.
++    for (int64_t kv : {4096, 20480}) {
++        for (int64_t nb : {512, 2048}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
++        }
++    }
++
++    // Prefill-shaped cases for Qwen3.8 27B on the P100 pair: head 256 (n_embd_head_k), 4 KV heads x 6, ubatch 256.
++    for (int64_t kv : {8192, 32768, 65536}) {
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16,  GGML_TYPE_F16));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
++        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
++    }
++    // The model's KV-cache layout (position-major: permute dims 1 and 2) at 64k, deployed cache types.
++    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 256, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}));
++    // Decode (nb=1) and MTP-verify (nb=4, 8) shapes at the same head/GQA layout, deployed cache types.
++    for (int64_t kv : {4096, 8192, 16384, 32768, 65536}) {
++        for (int64_t nb : {1, 4, 8}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
++        }
++    }
++
+     for (int kv : { 4096, 8192, 16384, }) {
+         for (int hs : { 64, 128, }) {
+             for (int nr : { 1, 4, }) {

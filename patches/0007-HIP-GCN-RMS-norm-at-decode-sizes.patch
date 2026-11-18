@@ -1,0 +1,157 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 15:54:35 -0600
+Subject: [PATCH 07/19] HIP GCN: RMS norm at decode sizes
+
+The row held in registers (16-byte loads), one wave for rows up to 512 and 4 waves for wider ones, DPP
+reduction plus one shared-memory step. MI25, Gemma 4 12B story at temperature 0: 34.4 -> 35.2-35.4 t/s.
+GGML_CUDA_RMS_GCN=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ ggml/src/ggml-cuda/norm.cu | 121 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 121 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index d8760a4ba..5916342d6 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -354,9 +354,124 @@ static void group_norm_f32_cuda(
+     }
+ }
+ 
++// RMS norm at decode sizes for GCN, latency first. In a decode graph every norm is a dependent launch
++// (Gemma 4 12B: 337 a token, ~10 us each = 11% of a token), and the generic kernel reduces a 3840-wide row over 16
++// waves through shared memory with barriers, then reads the row again. Here a row is held in registers (16-byte loads)
++// by one wave (head-sized rows) or 4, reduced with DPP plus one shared-memory step, and multiplied by a plain weight
++// (+ bias) vector without index math.
++// GGML_CUDA_RMS_GCN=0 turns it off.
++template <int NW, int NV4, bool do_multiply, bool do_add>
++__launch_bounds__(64*NW, 1)
++static __global__ void rms_norm_f32_gcn(const float * __restrict__ x, float * __restrict__ dst, const int ncols,
++        const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps,
++        const float * __restrict__ mul, const float * __restrict__ add) {
++    const int nrows     = gridDim.x;
++    const int nchannels = gridDim.y;
++    const int row       = blockIdx.x;
++    const int channel   = blockIdx.y;
++    const int sample    = blockIdx.z;
++    const int lane      = threadIdx.x;                // NW waves: thread t takes float4s t, t + 64*NW, ...
++    const int n4        = ncols / 4;
++
++    const float4 * x4 = (const float4 *) (x + sample*stride_sample + channel*stride_channel + row*stride_row);
++    float4       * d4 = (float4 *) (dst + ((int64_t) (sample*nchannels + channel)*nrows + row)*ncols);
++
++    float4 v[NV4];
++    float4 m[NV4];
++    float4 a[NV4];
++    float ss = 0.0f;
++#pragma unroll
++    for (int i = 0; i < NV4; ++i) {
++        const int k = lane + 64*NW*i;
++        if (k < n4) {
++            v[i] = x4[k];
++            if constexpr (do_multiply) {
++                m[i] = ((const float4 *) mul)[k];
++            }
++            if constexpr (do_add) {
++                a[i] = ((const float4 *) add)[k];
++            }
++            ss += v[i].x*v[i].x + v[i].y*v[i].y + v[i].z*v[i].z + v[i].w*v[i].w;
++        }
++    }
++    ss = warp_reduce_sum<64>(ss);
++    if constexpr (NW > 1) {                             // one shared-memory step, one barrier
++        __shared__ float part[NW];
++        if (lane % 64 == 0) {
++            part[lane / 64] = ss;
++        }
++        __syncthreads();
++        ss = 0.0f;
++#pragma unroll
++        for (int w = 0; w < NW; ++w) {
++            ss += part[w];
++        }
++    }
++    const float scale = rsqrtf(ss / ncols + eps);
++#pragma unroll
++    for (int i = 0; i < NV4; ++i) {
++        const int k = lane + 64*NW*i;
++        if (k < n4) {
++            float4 o = make_float4(v[i].x*scale, v[i].y*scale, v[i].z*scale, v[i].w*scale);
++            if constexpr (do_multiply) {
++                o = make_float4(o.x*m[i].x, o.y*m[i].y, o.z*m[i].z, o.w*m[i].w);
++            }
++            if constexpr (do_add) {
++                o = make_float4(o.x + a[i].x, o.y + a[i].y, o.z + a[i].z, o.w + a[i].w);
++            }
++            d4[k] = o;
++        }
++    }
++}
++
++// True if it ran. mul / add: plain vectors of ncols floats shared by every row, or nullptr.
++static bool rms_norm_f32_gcn_try(const float * x, float * dst, const int ncols, const int nrows, const int nchannels,
++        const int nsamples, const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample,
++        const float eps, const float * mul, const float * add, cudaStream_t stream) {
++#if defined(GGML_USE_HIP)
++    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_RMS_GCN"); return !e || atoi(e) != 0; }();
++    const auto aligned = [](const void * p) { return ((uintptr_t) p) % 16 == 0; };
++    if (!enabled || !GGML_CUDA_CC_IS_GCN(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) ||
++        ncols % 4 != 0 || ncols > 4096 || stride_row % 4 != 0 || stride_channel % 4 != 0 || stride_sample % 4 != 0 ||
++        !aligned(x) || !aligned(dst) || (mul && !aligned(mul)) || (add && !aligned(add))) {
++        return false;
++    }
++    const dim3 blocks_num(nrows, nchannels, nsamples);
++    // One wave for a head-sized row; 4 waves for a hidden-state row. Gemma 4 12B in-model (t/s): one wave per 3840 row
++    // 33.4 (3% slower than the generic kernel's 34.4), 2 waves 34.7, 4 waves 35.2-35.4, 8 waves 35.2, 16 waves 35.0.
++    const int nw  = ncols <= 512 ? 1 : 4;
++    const int nv4 = (ncols/4 + 64*nw - 1) / (64*nw);
++#define RMS_GCN_LAUNCH(NW_, NV4_)                                                                                    \
++    if (nw == NW_ && nv4 <= NV4_) {                                                                                  \
++        if (add) {                                                                                                   \
++            rms_norm_f32_gcn<NW_, NV4_, true, true><<<blocks_num, 64*NW_, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, add); \
++        } else if (mul) {                                                                                            \
++            rms_norm_f32_gcn<NW_, NV4_, true, false><<<blocks_num, 64*NW_, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, nullptr); \
++        } else {                                                                                                     \
++            rms_norm_f32_gcn<NW_, NV4_, false, false><<<blocks_num, 64*NW_, 0, stream>>>(x, dst, ncols, stride_row, stride_channel, stride_sample, eps, nullptr, nullptr); \
++        }                                                                                                            \
++        return true;                                                                                                 \
++    }
++    RMS_GCN_LAUNCH(1, 1)
++    RMS_GCN_LAUNCH(1, 2)
++    RMS_GCN_LAUNCH(4, 1)
++    RMS_GCN_LAUNCH(4, 2)
++    RMS_GCN_LAUNCH(4, 4)
++#undef RMS_GCN_LAUNCH
++    return false;
++#else
++    GGML_UNUSED_VARS(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, mul, add, stream);
++    return false;
++#endif // defined(GGML_USE_HIP)
++}
++
+ static void rms_norm_f32_cuda(
+         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
+         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
++    if (rms_norm_f32_gcn_try(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
++                             nullptr, nullptr, stream)) {
++        return;
++    }
+     const dim3 blocks_num(nrows, nchannels, nsamples);
+     static const bool rms128_enabled = [] {
+         const char * env = getenv("GGML_CUDA_GB10_RMS128");
+@@ -422,6 +537,12 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+         return;
+     }
++    if ((int) mul_ncols == ncols && mul_nrows == 1 && mul_nchannels == 1 && mul_nsamples == 1 &&
++        (add == nullptr || ((int) add_ncols == ncols && add_nrows == 1 && add_nchannels == 1 && add_nsamples == 1)) &&
++        rms_norm_f32_gcn_try(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps,
++                             mul, add, stream)) {
++        return;
++    }
+     if (add == nullptr) {
+         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+         const uint3 mul_nrows_packed     = init_fastdiv_values(mul_nrows);

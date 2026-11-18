@@ -1,0 +1,271 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 07:18:38 -0600
+Subject: [PATCH 12/19] HIP GCN: rocBLAS solution autotune for prompt GEMMs
+ (GGML_HIP_GEMM_TUNE_FILE)
+
+rocBLAS's default for the FFN down projection on gfx900 is a 32x32-tile kernel at 5.3-5.4 TFLOPS;
+another listed solution runs it at 14.7-17.2. The first call of a (cc, m, n bucket, k) times the default
+and every listed solution and keeps the fastest; choices are appended to GGML_HIP_GEMM_TUNE_FILE with the
+rocBLAS version and read back on load. MI25, 20k reads: Gemma 4 12B 313 -> 416 t/s, Qwen3.5 9B 505 ->
+666; writing unchanged. GGML_HIP_GEMM_TUNE=0 turns it off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu     |  16 +++
+ ggml/src/ggml-cuda/hip-gemm-tune.cu | 190 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/vendors/hip.h    |   2 +
+ 3 files changed, 208 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/hip-gemm-tune.cu
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7536a5d2a..6e3e1b94f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1406,6 +1406,12 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
+     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
+ };
+ 
++#if defined(GGML_USE_HIP)
++bool ggml_hip_gemm_tuned(int device, int cc, cudaStream_t stream, bool trans_a, bool trans_b, bool bucket_mk, int types,
++        int64_t m, int64_t n, int64_t k, const void * alpha, const void * A, int64_t lda, const void * B, int64_t ldb,
++        const void * beta, void * C, int64_t ldc, void * scratch = nullptr);
++#endif // defined(GGML_USE_HIP)
++
+ template<ggml_type compute_type>
+ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     using traits = batched_mul_mat_traits<compute_type>;
+@@ -1549,6 +1555,15 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+                                            (const float *) src1_ptr, s11,
+                     (const float *) beta,  (float       *)  dst_ptr, ne0));
+     } else if (ne12 == 1 && ne13 == 1) {
++#if defined(GGML_USE_HIP)
++        if (GGML_CUDA_CC_IS_GCN(cc) && cu_compute_type == CUBLAS_COMPUTE_16F && cu_data_type == CUDA_R_16F &&
++                cu_data_type_a == CUDA_R_16F && cu_data_type_b == CUDA_R_16F &&
++                ggml_hip_gemm_tuned(ctx.device, cc, main_stream, true, false, false, 0, ne01, ne11, ne10, alpha, src0_ptr, s01, src1_ptr, s11,
++                                    beta, dst_ptr, ne0)) {
++            // done by the rocBLAS solution autotune above
++        } else
++#endif // defined(GGML_USE_HIP)
++        {
+         CUBLAS_CHECK(
+             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                     ne01, ne11, ne10,
+@@ -1557,6 +1572,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+                     beta,   dst_ptr, cu_data_type,   ne0,
+                     cu_compute_type,
+                     CUBLAS_GEMM_DEFAULT_TENSOR_OP));
++        }
+     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
+         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
+         const int64_t sma = ne02 == 1 ? s03 : s02;
+diff --git a/ggml/src/ggml-cuda/hip-gemm-tune.cu b/ggml/src/ggml-cuda/hip-gemm-tune.cu
+new file mode 100644
+index 000000000..9494c0f9c
+--- /dev/null
++++ b/ggml/src/ggml-cuda/hip-gemm-tune.cu
+@@ -0,0 +1,190 @@
++// rocBLAS solution autotune for f16 GEMMs on GCN (model matmuls in ggml-cuda.cu, flash attention's in
++// fattn-gemm.cu). HIP only.
++#include "common.cuh"
++
++#if defined(GGML_USE_HIP)
++#define ROCBLAS_BETA_FEATURES_API
++#include <rocblas/rocblas.h>
++#include <map>
++#include <mutex>
++#include <string>
++#include <tuple>
++#include <vector>
++
++// rocBLAS solution autotune for the f16 GEMMs of prompt reading on GCN. rocBLAS's default kernel for the
++// feed-forward down projection on gfx900 uses 32x32 tiles: Gemma 4 12B's (3840 x 2048 x 15360) runs at 5.4 TFLOPS and
++// Qwen3.5 9B's (4096 x 1024 x 12288) at 5.3, while other solutions rocBLAS lists for the same call reach 17.2 and 14.7.
++// So the first call of a (device, m, n rounded up to a power of 2, k) times the default and every listed solution on
++// the real buffers (beta = 0, so the output is rewritten identically) and keeps the fastest. Calls under 128 columns
++// (writing) keep the default. Tuning a shape takes a few seconds (Gemma's set ~33 s), so with GGML_HIP_GEMM_TUNE_FILE
++// each choice is appended to that file with the GPU and rocBLAS version, and read back on the next load.
++// GGML_HIP_GEMM_TUNE=0 turns it off, GGML_HIP_GEMM_TUNE_LOG=1 prints each choice.
++// trans_a / trans_b: rocBLAS's op(A), op(B). types: 0 = f16 in, out and math; 1 = f16 in, f32 out and math (flash
++// attention's exact-product QK^T); 2 = f32 throughout (its fp32 PV). bucket_mk: m and k vary from call to call (flash attention over a growing
++// cache), so they are rounded up to powers of 2 like n, and the timing runs on a copy of the problem capped at 4096 in
++// m and n and 8192 in k (its first rows and columns of the same buffers).
++// scratch: with beta != 0 (accumulating into C) the timing calls write there instead, with beta = 0; it must hold an
++// m x n output at ldc. nullptr declines such calls.
++bool ggml_hip_gemm_tuned(int device, int cc, cudaStream_t stream, bool trans_a, bool trans_b, bool bucket_mk, int types,
++        int64_t m, int64_t n, int64_t k, const void * alpha, const void * A, int64_t lda, const void * B, int64_t ldb,
++        const void * beta, void * C, int64_t ldc, void * scratch) {
++    static const bool enabled = [] { const char * e = getenv("GGML_HIP_GEMM_TUNE"); return !(e && e[0] == '0'); }();
++    static const bool log_on  = [] { const char * e = getenv("GGML_HIP_GEMM_TUNE_LOG"); return e && e[0] == '1'; }();
++    if (!enabled || n < 128 || m > INT32_MAX || n > INT32_MAX || k > INT32_MAX) {
++        return false;
++    }
++    if (types < 0 || types > 2) {
++        return false;
++    }
++    float bf = 0.0f;
++    if (types == 0) {
++        _Float16 b0;
++        memcpy(&b0, beta, sizeof(b0));
++        bf = (float) b0;
++    } else {
++        memcpy(&bf, beta, sizeof(bf));
++    }
++    if (bf != 0.0f && scratch == nullptr) {
++        return false;
++    }
++    static const _Float16 zero_h = 0;
++    static const float    zero_f = 0.0f;
++    const void * beta_t = bf != 0.0f ? (types == 0 ? (const void *) &zero_h : (const void *) &zero_f) : beta;   // timing
++    void       * C_t    = bf != 0.0f ? scratch : C;
++    static std::mutex mtx;
++    static std::map<int, rocblas_handle> handles;
++    static std::map<std::tuple<int, int, int64_t, int64_t, int64_t>, int> cache;   // (cc, op, m, n, k) -> solution
++    static std::string file;
++    static std::string ver;
++    static bool loaded = false;
++    std::lock_guard<std::mutex> lock(mtx);
++
++    if (!loaded) {
++        loaded = true;
++        size_t len = 0;
++        if (rocblas_get_version_string_size(&len) == rocblas_status_success && len > 0) {
++            std::vector<char> buf(len + 1, 0);
++            if (rocblas_get_version_string(buf.data(), len) == rocblas_status_success) {
++                ver = buf.data();
++                for (char & c : ver) {
++                    if (c == ' ') {
++                        c = '_';
++                    }
++                }
++            }
++        }
++        const char * f = getenv("GGML_HIP_GEMM_TUNE_FILE");
++        if (f && f[0]) {
++            file = f;
++            if (FILE * fp = fopen(f, "r")) {
++                char line[512], v[128];
++                int fcc, fop, sol;
++                long long fm, fn, fk;
++                int nread = 0;
++                while (fgets(line, sizeof(line), fp)) {
++                    if (sscanf(line, "%d %127s op%d %lld %lld %lld %d", &fcc, v, &fop, &fm, &fn, &fk, &sol) == 7 ||
++                        (fop = 1, sscanf(line, "%d %127s %lld %lld %lld %d", &fcc, v, &fm, &fn, &fk, &sol) == 6)) {
++                        if (ver == v) {
++                            cache[std::make_tuple(fcc, fop, (int64_t) fm, (int64_t) fn, (int64_t) fk)] = sol;
++                            nread++;
++                        }
++                    }
++                }
++                fclose(fp);
++                if (log_on) {
++                    GGML_LOG_INFO("%s: %d saved choices for rocBLAS %s from %s\n", __func__, nread, ver.c_str(), f);
++                }
++            }
++        }
++    }
++
++    rocblas_handle & h = handles[device];
++    if (h == nullptr && rocblas_create_handle(&h) != rocblas_status_success) {
++        h = nullptr;
++        return false;
++    }
++    rocblas_set_stream(h, stream);
++
++    const rocblas_datatype TAB = types == 2 ? rocblas_datatype_f32_r : rocblas_datatype_f16_r;   // A and B
++    const rocblas_datatype TCC = types == 0 ? rocblas_datatype_f16_r : rocblas_datatype_f32_r;   // C, D and the math
++    const rocblas_operation ta = trans_a ? rocblas_operation_transpose : rocblas_operation_none;
++    const rocblas_operation tb = trans_b ? rocblas_operation_transpose : rocblas_operation_none;
++    const int op = (trans_a ? 1 : 0) + (trans_b ? 2 : 0) + 4*types;   // saved as "opN"; old lines are op1 = T,N f16
++    auto bucket = [](int64_t x) { int64_t b = 128; while (b < x) { b *= 2; } return b; };
++    auto gemm_into = [&](int sol, int64_t gm, int64_t gn, int64_t gk, const void * bt, void * Cd) {
++        return rocblas_gemm_ex(h, ta, tb, (rocblas_int) gm, (rocblas_int) gn, (rocblas_int) gk,
++                               alpha, A, TAB, (rocblas_int) lda, B, TAB, (rocblas_int) ldb, bt, Cd, TCC, (rocblas_int) ldc,
++                               Cd, TCC, (rocblas_int) ldc, TCC,
++                               sol ? rocblas_gemm_algo_solution_index : rocblas_gemm_algo_standard, sol, 0);
++    };
++    auto gemm_mnk = [&](int sol, int64_t gm, int64_t gn, int64_t gk) { return gemm_into(sol, gm, gn, gk, beta_t, C_t); };   // timing
++    auto gemm     = [&](int sol) { return gemm_into(sol, m, n, k, beta, C); };                                            // the call
++    const int64_t nb = bucket(n);
++    const int64_t mb = bucket_mk ? bucket(m) : m;
++    const int64_t kb = bucket_mk ? bucket(k) : k;
++    const auto key = std::make_tuple(cc, op, mb, nb, kb);
++    // the timed problem: the call itself, or its capped copy when m and k vary
++    const int64_t tm = bucket_mk ? std::min<int64_t>(m, 4096) : m;
++    const int64_t tn = bucket_mk ? std::min<int64_t>(n, 4096) : n;
++    const int64_t tk = bucket_mk ? std::min<int64_t>(k, 8192) : k;
++    auto it = cache.find(key);
++    if (it == cache.end()) {
++        rocblas_int cnt = 0;
++        std::vector<rocblas_int> sols;
++        if (rocblas_gemm_ex_get_solutions(h, ta, tb, (rocblas_int) tm, (rocblas_int) tn,
++                (rocblas_int) tk, alpha, A, TAB, (rocblas_int) lda, B, TAB, (rocblas_int) ldb, beta_t, C_t, TCC, (rocblas_int) ldc, C_t, TCC,
++                (rocblas_int) ldc, TCC, rocblas_gemm_algo_solution_index, 0, nullptr, &cnt) == rocblas_status_success && cnt > 0) {
++            sols.resize(cnt);
++            if (rocblas_gemm_ex_get_solutions(h, ta, tb, (rocblas_int) tm, (rocblas_int) tn,
++                    (rocblas_int) tk, alpha, A, TAB, (rocblas_int) lda, B, TAB, (rocblas_int) ldb, beta_t, C_t, TCC, (rocblas_int) ldc, C_t, TCC,
++                    (rocblas_int) ldc, TCC, rocblas_gemm_algo_solution_index, 0, sols.data(), &cnt) != rocblas_status_success) {
++                sols.clear();
++            }
++        }
++        sols.insert(sols.begin(), 0);                       // 0 = rocBLAS's own choice
++        cudaEvent_t e0, e1;
++        CUDA_CHECK(cudaEventCreate(&e0));
++        CUDA_CHECK(cudaEventCreate(&e1));
++        int   best    = 0;
++        float best_ms = 1e30f, def_ms = 0.0f;
++        for (int sol : sols) {
++            if (gemm_mnk(sol, tm, tn, tk) != rocblas_status_success) {      // the untimed call is also the support check
++                continue;
++            }
++            CUDA_CHECK(cudaEventRecord(e0, stream));
++            gemm_mnk(sol, tm, tn, tk);
++            gemm_mnk(sol, tm, tn, tk);
++            CUDA_CHECK(cudaEventRecord(e1, stream));
++            CUDA_CHECK(cudaEventSynchronize(e1));
++            float ms = 0.0f;
++            CUDA_CHECK(cudaEventElapsedTime(&ms, e0, e1));
++            if (sol == 0) {
++                def_ms = ms / 2;
++            }
++            if (ms / 2 < best_ms) {
++                best_ms = ms / 2;
++                best    = sol;
++            }
++        }
++        CUDA_CHECK(cudaEventDestroy(e0));
++        CUDA_CHECK(cudaEventDestroy(e1));
++        it = cache.emplace(key, best).first;
++        if (!file.empty() && !ver.empty()) {
++            if (FILE * fp = fopen(file.c_str(), "a")) {
++                fprintf(fp, "%d %s op%d %lld %lld %lld %d %.3f %.3f\n", cc, ver.c_str(), op, (long long) mb, (long long) nb,
++                        (long long) kb, best, best_ms, def_ms);
++                fclose(fp);
++            }
++        }
++        if (log_on) {
++            GGML_LOG_INFO("%s: op%d m=%lld n=%lld k=%lld (key %lld %lld %lld): solution %d %.3f ms vs default %.3f ms (%zu tried)\n",
++                __func__, op, (long long) m, (long long) n, (long long) k, (long long) mb, (long long) nb, (long long) kb, best, best_ms,
++                def_ms, sols.size());
++        }
++    }
++    if (it->second != 0 && gemm(it->second) == rocblas_status_success) {
++        return true;
++    }
++    return gemm(0) == rocblas_status_success;
++}
++#endif // defined(GGML_USE_HIP)
+diff --git a/ggml/src/ggml-cuda/vendors/hip.h b/ggml/src/ggml-cuda/vendors/hip.h
+index a5446ecf7..10a40b521 100644
+--- a/ggml/src/ggml-cuda/vendors/hip.h
++++ b/ggml/src/ggml-cuda/vendors/hip.h
+@@ -62,6 +62,8 @@
+ #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
+ #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+ #define cudaEventCreateWithFlags hipEventCreateWithFlags
++#define cudaEventCreate hipEventCreate
++#define cudaEventElapsedTime hipEventElapsedTime
+ #define cudaEventDisableTiming hipEventDisableTiming
+ #define cudaEventRecord hipEventRecord
+ #define cudaEventSynchronize hipEventSynchronize

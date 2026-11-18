@@ -1,0 +1,365 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: superslor <289523157+superslor@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 11:20:03 -0600
+Subject: [PATCH 01/19] CUDA FA: skip KV blocks that a unified KV cache fully
+ masks
+
+With --kv-unified a sequence's cells are interleaved with the other sequences', so fully masked blocks
+sit inside the KV range where the tail trim cannot reach them. A bitmap of live 256-cell blocks lets the
+vec and tile kernels skip the dead ones; output is unchanged. Also bounds the mask scan to the real token
+count (it read one row past the mask at 3 tokens with ncols1 4).
+
+V100, Qwen3 hybrid Q6_K, -c 262144 -np 4: a 93-token request with a 67k conversation parked in another
+slot 18.18 -> 25.05 t/s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TS8XWm5bp2cWmYvbQ5tTBK
+---
+ ggml/src/ggml-cuda/fattn-common.cuh  | 127 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/fattn-mma-f16.cuh |   4 +-
+ ggml/src/ggml-cuda/fattn-tile.cuh    |  35 +++++---
+ ggml/src/ggml-cuda/fattn-vec.cuh     |  16 +++-
+ 4 files changed, 168 insertions(+), 14 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-common.cuh b/ggml/src/ggml-cuda/fattn-common.cuh
+index e67cc7fdf..0ae4bd288 100644
+--- a/ggml/src/ggml-cuda/fattn-common.cuh
++++ b/ggml/src/ggml-cuda/fattn-common.cuh
+@@ -25,6 +25,7 @@ typedef void (* fattn_kernel_t)(
+         const char * __restrict__ mask,
+         const char * __restrict__ sinks,
+         const int  * __restrict__ KV_max,
++        const int  * __restrict__ KV_blocks,
+         float      * __restrict__ dst,
+         float2     * __restrict__ dst_meta,
+         const float scale,
+@@ -718,6 +719,102 @@ static __global__ void flash_attn_mask_to_KV_max(
+     KV_max[sequence*ne31 + jt] = KV_max_sj;
+ }
+ 
++// Maximum number of KV blocks (of FATTN_KQ_STRIDE each) for which a skip list is built.
++// 2048 blocks * FATTN_KQ_STRIDE == 512k context; beyond that fall back to the KV_max tail trim.
++#define FATTN_MAX_KV_BLOCKS 2048
++
++// Below this KV length the scan is not worth its own launch overhead.
++#define FATTN_KV_BITS_MIN_KV 4096
++
++// Build a BITMAP of the KV blocks that contain at least one non-masked value, one bit per
++// block of FATTN_KQ_STRIDE tokens, for each (sequence, j-tile). Layout per (sequence, jt):
++// nwords = ceil(ne30/32) consecutive words, bit kb%32 of word kb/32 set == block kb is live.
++//
++// flash_attn_mask_to_KV_max above only trims fully-masked blocks off the TAIL. With a unified
++// KV cache several sequences share one cell pool, so a sequence's own cells are interleaved
++// with other sequences' cells and the fully-masked blocks sit in the INTERIOR, where the tail
++// trim cannot reach them. Listing the blocks explicitly skips those too.
++//
++// Skipping in place rather than compacting is deliberate: a fully-masked block contributes
++// exactly 0 to both the softmax numerator and denominator and leaves the running maximum
++// untouched, so as long as each CUDA block still visits the remaining blocks in the same
++// order, dropping the fully-masked ones is bit-for-bit identical to processing them.
++#define FATTN_BLOCKS_NTHREADS 256
++
++template <int ncols1>
++__launch_bounds__(FATTN_BLOCKS_NTHREADS, 1)
++static __global__ void flash_attn_mask_to_KV_bits(
++        const half2 * mask_ptr, int * bits_ptr, const int ne30, const int64_t s31, const int64_t s33, const int nrows) {
++    const half2 * GGML_CUDA_RESTRICT mask = mask_ptr;
++    int         * GGML_CUDA_RESTRICT bits = bits_ptr;
++
++    constexpr int nwarps = FATTN_BLOCKS_NTHREADS / WARP_SIZE;
++
++    const int ntiles   = gridDim.x;
++    const int jt       = blockIdx.x;
++    const int sequence = blockIdx.y;
++    const int lane     = threadIdx.x % WARP_SIZE;
++    const int warp_id  = threadIdx.x / WARP_SIZE;
++    const int nwords   = (ne30 + 31) / 32;
++
++    mask += sequence*s33 + jt*ncols1*s31;
++
++    __shared__ int words[FATTN_MAX_KV_BLOCKS/32];
++
++    for (int i = threadIdx.x; i < nwords; i += FATTN_BLOCKS_NTHREADS) {
++        words[i] = 0;
++    }
++
++    ggml_cuda_pdl_sync();
++    __syncthreads();
++
++    // Each warp tests whole KV blocks independently; only the shared bitmap is contended.
++    for (int kb = warp_id; kb < ne30; kb += nwarps) {
++        int all_inf = 1;
++
++#pragma unroll
++        for (int j = 0; j < ncols1; ++j) {
++            // the mask has exactly nrows (= n_tokens) rows, not a multiple of ncols1.
++            // Reading the padding columns' rows went past the mask (one 512 KB row per missing column at kv=262144):
++            // harmless for the result (a stray row can only mark a block live) but an out-of-bounds read that
++            // faulted once nothing mapped followed the mask. Padding columns have no mask row; skip them.
++            if (jt*ncols1 + j >= nrows) {
++                break;
++            }
++            const half2 * row = mask + j*s31 + kb*(FATTN_KQ_STRIDE/2);
++
++            for (int i = lane; i < FATTN_KQ_STRIDE/2; i += WARP_SIZE) {
++                const float2 tmp = __half22float2(row[i]);
++                all_inf = all_inf && int(isinf(tmp.x)) && int(isinf(tmp.y));
++            }
++        }
++
++        all_inf = warp_reduce_all(all_inf);
++
++        if (lane == 0 && !all_inf) {
++            atomicOr(&words[kb / 32], 1 << (kb % 32));
++        }
++    }
++
++    __syncthreads();
++
++    int * out = bits + (sequence*ntiles + jt)*nwords;
++    for (int i = threadIdx.x; i < nwords; i += FATTN_BLOCKS_NTHREADS) {
++        out[i] = words[i];
++    }
++}
++
++// Is the KV block containing token k_VKQ_0 live for this (sequence, j-tile)?
++// KV_bits_row == nullptr means "no skip information available", i.e. treat every block as live.
++static __device__ __forceinline__ bool fattn_kv_block_live(
++        const int * __restrict__ KV_bits_row, const int k_VKQ_0) {
++    if (!KV_bits_row) {
++        return true;
++    }
++    const int kb = k_VKQ_0 / FATTN_KQ_STRIDE;
++    return (KV_bits_row[kb / 32] >> (kb % 32)) & 1;
++}
++
+ template<int D, int ncols1, int ncols2> // D == head size
+ __launch_bounds__(D, 1)
+ static __global__ void flash_attn_stream_k_fixup_uniform(
+@@ -1006,6 +1103,7 @@ void launch_fattn(
+         ggml_cuda_flash_attn_ext_get_f16_extra_data(KQV, need_f16_K, need_f16_V);
+ 
+     ggml_cuda_pool_alloc<int>    KV_max(pool);
++    ggml_cuda_pool_alloc<int>    KV_blocks(pool);
+     ggml_cuda_pool_alloc<float>  dst_tmp(pool);
+     ggml_cuda_pool_alloc<float2> dst_tmp_meta(pool);
+ 
+@@ -1088,6 +1186,34 @@ void launch_fattn(
+     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
+     const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+ 
++    // Bitmap of the KV blocks that contain any non-masked value. KV_max below only trims
++    // fully-masked blocks off the TAIL; with a unified KV cache the sequences share one cell
++    // pool, so a sequence's own cells are interleaved with the other sequences' cells and the
++    // fully-masked blocks sit in the INTERIOR where the tail trim cannot reach them. Without
++    // this, every sequence pays for the total number of cells in use rather than its own.
++    // Restricted to kernels that walk the KV cache with blockIdx.y; the stream-k path
++    // distributes work differently and is not handled here.
++    if (mask && !stream_k && K->ne[1] % FATTN_KQ_STRIDE == 0 && K->ne[1] >= FATTN_KV_BITS_MIN_KV) {
++        const int iter_k_bits = K->ne[1] / FATTN_KQ_STRIDE;
++
++        if (iter_k_bits > 1 && iter_k_bits <= FATTN_MAX_KV_BLOCKS) {
++            const int64_t s31 = mask->nb[1] / sizeof(half2);
++            const int64_t s33 = mask->nb[3] / sizeof(half2);
++
++            const dim3 blocks_num_bits(ntiles_x, Q->ne[3], 1);
++            const dim3 block_dim_bits(FATTN_BLOCKS_NTHREADS, 1, 1);
++
++            const int nwords = (iter_k_bits + 31) / 32;
++
++            KV_blocks.alloc(size_t(blocks_num_bits.x) * blocks_num_bits.y * nwords);
++            ggml_cuda_kernel_launch_params launch_params_bits =
++                ggml_cuda_kernel_launch_params(blocks_num_bits, block_dim_bits, 0, main_stream);
++            ggml_cuda_kernel_launch(flash_attn_mask_to_KV_bits<ncols1>, launch_params_bits,
++                (const half2 *) mask->data, KV_blocks.ptr, iter_k_bits, s31, s33, (int) mask->ne[1]);
++            CUDA_CHECK(cudaGetLastError());
++        }
++    }
++
+     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
+     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
+     //     multiple sequences of possibly different lengths.
+@@ -1215,6 +1341,7 @@ void launch_fattn(
+         mask ? ((const char *) mask->data) : nullptr,
+         sinks ? ((const char *) sinks->data) : nullptr,
+         KV_max.ptr,
++        KV_blocks.ptr,
+         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
+         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
+         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
+diff --git a/ggml/src/ggml-cuda/fattn-mma-f16.cuh b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+index 7f4cfd551..4fc74b462 100644
+--- a/ggml/src/ggml-cuda/fattn-mma-f16.cuh
++++ b/ggml/src/ggml-cuda/fattn-mma-f16.cuh
+@@ -1709,6 +1709,7 @@ static __global__ void flash_attn_ext_f16(
+         const char * mask_ptr,
+         const char * sinks_ptr,
+         const int  * KV_max_ptr,
++        const int  * KV_bits_ptr,
+         float      * dst_ptr,
+         float2     * dst_meta_ptr,
+         const float scale,
+@@ -1732,6 +1733,7 @@ static __global__ void flash_attn_ext_f16(
+     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
+     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
+     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
++    GGML_UNUSED(KV_bits_ptr); // stream-k path: KV block skipping not implemented here
+     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+ 
+@@ -1879,7 +1881,7 @@ static __global__ void flash_attn_ext_f16(
+         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta, scale, slope, logit_softcap,
+          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
+ #else
+-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_bits_ptr, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+         ne00, ne01, ne02, ne03,
+               nb01, nb02, nb03,
+diff --git a/ggml/src/ggml-cuda/fattn-tile.cuh b/ggml/src/ggml-cuda/fattn-tile.cuh
+index d1164b852..7423d82ec 100644
+--- a/ggml/src/ggml-cuda/fattn-tile.cuh
++++ b/ggml/src/ggml-cuda/fattn-tile.cuh
+@@ -797,6 +797,7 @@ static __global__ void flash_attn_tile(
+         const char * mask_ptr,
+         const char * sinks_ptr,
+         const int  * KV_max_ptr,
++        const int  * KV_bits_ptr,
+         float      * dst_ptr,
+         float2     * dst_meta_ptr,
+         const float scale,
+@@ -819,13 +820,14 @@ static __global__ void flash_attn_tile(
+     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
+     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
+     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
++    const int  * GGML_CUDA_RESTRICT KV_bits  = KV_bits_ptr;
+     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+ 
+     // Skip unused kernel variants for faster compilation:
+ 
+     if ((use_logit_softcap && !(DV == 128 || DV == 256 || DV == 512))) {
+-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
++        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_bits, dst, dst_meta, scale,
+             max_bias, m0, m1, n_head_log2, logit_softcap,
+             ne00, ne01, ne02, ne03,
+                   nb01, nb02, nb03,
+@@ -952,29 +954,40 @@ static __global__ void flash_attn_tile(
+ 
+     // Main loop over KV cache:
+     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
++
++    // Fully-masked KV blocks are skipped in place: the iteration order of the remaining
++    // blocks is unchanged, and a fully-masked block would contribute exactly 0 anyway.
++    const int nwords_KV = (ne11/FATTN_KQ_STRIDE + 31) / 32;
++    const int * KV_bits_row = KV_bits ? KV_bits + (sequence*gridDim.x + blockIdx.x)*nwords_KV : nullptr;
+     if (ncols2 == 1) {
+         // Branch with out-of-bounds checks.
+         int k_VKQ_0 = blockIdx.y*nbatch_fa;
+         while (k_VKQ_0 < k_VKQ_max - nbatch_fa) {
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++            if (fattn_kv_block_live(KV_bits_row, k_VKQ_0)) {
++                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++            }
+             k_VKQ_0 += gridDim.y*nbatch_fa;
+         }
+         if (k_VKQ_0 < k_VKQ_max) {
+             constexpr bool oob_check = true;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++            if (fattn_kv_block_live(KV_bits_row, k_VKQ_0)) {
++                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++            }
+         }
+     } else {
+         // Branch without out-of-bounds checks.
+         for (int k_VKQ_0 = blockIdx.y*nbatch_fa; k_VKQ_0 < k_VKQ_max; k_VKQ_0 += gridDim.y*nbatch_fa) {
+             constexpr bool oob_check = false;
+-            flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
+-                (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
+-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++            if (fattn_kv_block_live(KV_bits_row, k_VKQ_0)) {
++                flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check>
++                    (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
++                    stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
++            }
+         }
+     }
+ 
+@@ -1132,7 +1145,7 @@ static __global__ void flash_attn_tile(
+         }
+     }
+ #else
+-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_bits_ptr, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+         ne00, ne01, ne02, ne03,
+               nb01, nb02, nb03,
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 69dd93686..e0767062f 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -25,6 +25,7 @@ static __global__ void flash_attn_ext_vec(
+         const char * mask_ptr,
+         const char * sinks_ptr,
+         const int  * KV_max_ptr,
++        const int  * KV_bits_ptr,
+         float      * dst_ptr,
+         float2     * dst_meta_ptr,
+         const float scale,
+@@ -48,12 +49,13 @@ static __global__ void flash_attn_ext_vec(
+     const char * GGML_CUDA_RESTRICT mask     = mask_ptr;
+     const char * GGML_CUDA_RESTRICT sinks    = sinks_ptr;
+     const int  * GGML_CUDA_RESTRICT KV_max   = KV_max_ptr;
++    const int  * GGML_CUDA_RESTRICT KV_bits  = KV_bits_ptr;
+     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
+     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
+ 
+     // Skip unused kernel variants for faster compilation:
+     if (use_logit_softcap && !(D == 128 || D == 256)) {
+-        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
++        GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_bits, dst, dst_meta, scale,
+             max_bias, m0, m1, n_head_log2, logit_softcap,
+             ne00, ne01, ne02, ne03,
+                   nb01, nb02, nb03,
+@@ -248,6 +250,10 @@ static __global__ void flash_attn_ext_vec(
+     }
+ 
+     const int k_VKQ_max = KV_max ? KV_max[sequence*gridDim.x + blockIdx.x] : ne11;
++
++    // Fully-masked KV blocks are skipped in place, see fattn_kv_block_live.
++    const int nwords_KV = (ne11/FATTN_KQ_STRIDE + 31) / 32;
++    const int * KV_bits_row = KV_bits ? KV_bits + (sequence*gridDim.x + blockIdx.x)*nwords_KV : nullptr;
+     K     += blockIdx.y*nthreads * nb11;
+     V     += blockIdx.y*nthreads * nb21;
+     maskh += blockIdx.y*nthreads;
+@@ -255,6 +261,12 @@ static __global__ void flash_attn_ext_vec(
+              // Increment pointers after each loop:
+              K += gridDim.y*nthreads*nb11, V += gridDim.y*nthreads*nb21, maskh += gridDim.y*nthreads) {
+ 
++        // The condition is uniform across the CUDA block, so skipping cannot desynchronise
++        // the __syncthreads() calls further down.
++        if (!fattn_kv_block_live(KV_bits_row, k_VKQ_0)) {
++            continue;
++        }
++
+         // Calculate KQ tile and keep track of new maximum KQ values:
+         float KQ_reg[ncols]; // KQ in registers.
+ 
+@@ -514,7 +526,7 @@ static __global__ void flash_attn_ext_vec(
+         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
+     }
+ #else
+-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
++    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_bits_ptr, dst_ptr, dst_meta_ptr, scale,
+         max_bias, m0, m1, n_head_log2, logit_softcap,
+         ne00, ne01, ne02, ne03,
+               nb01, nb02, nb03,
