@@ -22,7 +22,7 @@ All at 262k context, both cards, `split-mode = tensor`. Read = prompt processing
 
 | Model | Read (t/s) | Write (t/s) |
 |---|---|---|
-| Qwen3.8 27B Q6 | 273 on a 20k prompt (118 without the HIP all-reduce) | ~28 for code, 18-20 for prose |
+| Qwen3.8 27B Q6 | 274 on a 20k prompt (117 without the HIP all-reduce) | ~28 for code, ~18 for prose |
 | Gemma 4 26B-A4B (QAT Q4_K_XL) | 723 on a 20k prompt | 46 |
 | Qwen3.6 35B-A3B (Q4) | about 570 | about 50 |
 
