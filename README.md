@@ -23,8 +23,10 @@ All at 262k context, both cards, `split-mode = tensor`. Read = prompt processing
 | Model | Read (t/s) | Write (t/s) |
 |---|---|---|
 | Qwen3.8 27B Q6 | 274 on a 20k prompt (117 without the HIP all-reduce) | ~28 for code, ~18 for prose |
-| Gemma 4 26B-A4B (QAT Q4_K_XL) | 723 on a 20k prompt | 46 |
-| Qwen3.6 35B-A3B (Q4) | about 570 | about 50 |
+| Gemma 4 26B-A4B (Q4_0, QAT) | 723 on a 20k prompt | 46 |
+| Qwen3.6 35B-A3B (Q4_K_M) | about 570 | about 50 |
+
+Weights quantized by Unsloth (Qwen3.8 27B: Q6_K). KV cache on every model: keys q8_0, values q4_0.
 
 Qwen3.8 27B writes with MTP drafts, which keep about 80% of their guesses for code and about 40% for prose.
 One card, Gemma 4 12B: raising the cap from 110 W to 200 W took a 20k read from 261 to 411 t/s.
